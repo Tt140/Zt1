@@ -1,0 +1,17 @@
+{
+  "incident_id": "inc-test-timeout",
+  "instance_id": "i-test001",
+  "phase": "escalated",
+  "total_events": 2,
+  "evidence": [],
+  "hypotheses": [],
+  "proposed_steps": [],
+  "policy_decisions": [],
+  "generated_at": "2026-10-21T19:07:00.319304+00:00",
+  "escalation": {
+    "reason": "Slack approval timed out after 300s. Automated remediation halted safely (Fail-Closed).",
+    "report_ref": "reports/incident_inc-test-timeout.json",
+    "actor": "system",
+    "seq": 0
+  }
+}

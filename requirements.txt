@@ -1,0 +1,14 @@
+# Runtime dependencies only — bundled into AWS Lambda deployment package
+# DO NOT add testing or development dependencies here.
+
+# AWS SDK
+boto3>=1.34.0
+botocore>=1.34.0
+
+# HTTP & API Clients
+requests>=2.31.0
+urllib3>=2.0.0
+httpx>=0.27.0
+
+# Identifiers
+python-ulid>=1.1.0

@@ -1,0 +1,13 @@
+# Development & testing dependencies — NOT bundled into Lambda deployment package.
+# Install with: pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+# Test runner & concurrency plugins
+pytest>=8.0.0
+pytest-cov>=4.1.0
+pytest-xdist>=3.5.0
+anyio>=4.0.0
+
+# AWS mocking (DynamoDB + S3 for conformance test suite)
+moto[dynamodb,s3]>=5.0.0

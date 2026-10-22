@@ -1,0 +1,60 @@
+# .samignore — files/dirs excluded from the SAM Lambda deployment package
+# SAM reads this during `sam build` when packaging CodeUri=./
+
+# Version control & environments
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+
+# Tests, demos, and scripts (not needed at runtime in Lambda)
+tests/
+demos/
+scripts/
+conftest.py
+conftest_phase4.py
+pytest.ini
+
+# Documentation & packaging metadata
+docs/
+*.md
+pyproject.toml
+onboarding_report.json
+*.onboarded
+
+# Dev dependencies
+requirements-dev.txt
+
+# Python cache & artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Local tooling & virtual environments
+.venv/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temp and scratch
+tmp/
+scratch/
+
+# Eval recordings (large, runtime-only used locally)
+src/eval/recordings.py
+
+# SAM build artifacts (already excluded by SAM itself)
+.aws-sam/
+
+# NOTE: docker_lab.py is NOT excluded — executor_fn.py imports it as local fallback
+# when SSM_EXEC_ROLE_ARN is not set. In production it won't be called, but must be importable.

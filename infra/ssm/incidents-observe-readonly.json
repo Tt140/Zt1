@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Read-only observation — no modification allowed",
+  "parameters": {
+    "command": {
+      "type": "String",
+      "allowedPattern": "^(sudo )?(df|du|free|top|ps|cat|head|tail|ls|stat|find|systemctl|journalctl|dmesg|uptime|netstat|ss|lsof|wc|grep|curl|pgrep|mpstat|vmstat|pidstat|echo|date|id|whoami|uname|hostname).*",
+      "description": "Read-only command (allowlist enforced)"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "runObservation",
+      "inputs": {
+        "runCommand": [
+          "{{ command }}"
+        ],
+        "timeoutSeconds": "60"
+      }
+    }
+  ]
+}

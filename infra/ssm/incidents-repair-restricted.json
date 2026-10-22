@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Restricted repair operations — allowlist enforced",
+  "parameters": {
+    "command": {
+      "type": "String",
+      "allowedPattern": "^(sudo )?(systemctl restart|systemctl start|systemctl stop|systemctl reload|rm -f|truncate|mv|cp|kill|pkill).*",
+      "description": "Restricted repair command (allowlist enforced)"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "runRepair",
+      "inputs": {
+        "runCommand": [
+          "{{ command }}"
+        ],
+        "timeoutSeconds": "120"
+      }
+    }
+  ]
+}

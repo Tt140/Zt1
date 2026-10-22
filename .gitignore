@@ -1,0 +1,46 @@
+# Environments and Secrets
+.env
+.env.*
+!.env.example
+
+# Python cache & compiled bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Testing and Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# AWS SAM build directory
+.aws-sam/
+
+# Databases & local state
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+*.logs
+nohup.out
+
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Onboarding Artifacts & Reports
+onboarding_report.json
+.env.onboarded
+*.onboarded
+

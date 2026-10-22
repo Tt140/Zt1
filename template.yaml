@@ -1,0 +1,820 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  incidents-agents-aws — Autonomous Incident Remediation System
+  Production Serverless Architecture: 6 Specialized Lambdas, Zero-Trust SSM Documents,
+  DynamoDB EventStore, IAM Isolation, CloudWatch Alarms & EventBridge Orchestration.
+
+# ── Parameters ───────────────────────────────────────────────────────────────
+
+Parameters:
+  TargetInstanceId:
+    Type: String
+    Default: ""
+    Description: "EC2 instance ID to monitor and remediate (empty = no instance-specific alarms)"
+
+  StrandsUrl:
+    Type: String
+    Default: "embedded"
+    Description: "HTTP URL of Strands Decider EC2 service (or 'embedded' for intelligent self-contained in-memory routing)"
+
+  NovaFlashModelId:
+    Type: String
+    Default: "amazon.nova-lite-v1:0"
+    Description: "Bedrock Nova Flash model ID"
+
+  NovaProModelId:
+    Type: String
+    Default: "amazon.nova-pro-v1:0"
+    Description: "Bedrock Nova Pro model ID"
+
+  DeepSeekBaseUrl:
+    Type: String
+    Default: "https://bedrock-mantle.us-east-1.api.aws/v1"
+    Description: "DeepSeek API base endpoint (Bedrock Mantle endpoint or direct)"
+
+  DeepSeekFlashModel:
+    Type: String
+    Default: "deepseek.v3.1"
+    Description: "DeepSeek Flash model ID"
+
+  DeepSeekProModel:
+    Type: String
+    Default: "deepseek.v3.2"
+    Description: "DeepSeek Pro model ID"
+
+  CreateDynamoTables:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Create DynamoDB tables if they do not exist; set false to use existing tables"
+
+  CreateBlobsBucket:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Create S3 bucket for incident blobs; set false to use existing bucket"
+
+  ExistingBlobsBucketName:
+    Type: String
+    Default: ""
+    Description: "Name of existing S3 bucket if CreateBlobsBucket is false"
+
+  CreateSsmDocuments:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Create SSM documents (incidents-observe-readonly and incidents-repair-restricted) if they do not exist"
+
+  CreateCoreIamRoles:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Create core IAM roles (incidents-agent-role, incidents-observer-role, RemediationOperatorRole); set false if already created"
+
+  EnableAlarms:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Enable CloudWatch metric alarms for TargetInstanceId"
+
+  EnableDiskAlarm:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "Enable CloudWatch disk bloat alarm via CWAgent (requires CWAgent installed on EC2)"
+
+  SlackBotTokenSecretArn:
+    Type: String
+    Default: ""
+    Description: "ARN of Secrets Manager secret: /incidents/slack-bot-token"
+
+  SlackSigningSecretArn:
+    Type: String
+    Default: ""
+    Description: "ARN of Secrets Manager secret: /incidents/slack-signing-secret"
+
+  ApprovalMacKeyHex:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: "32-byte hex MAC key for approval HMAC — generate: openssl rand -hex 32"
+
+  SlackAuthorizedApprovers:
+    Type: String
+    Default: ""
+    Description: "Comma-separated Slack user IDs authorized to approve Tier.T2 actions (e.g. U123456,U789012)"
+
+  SsmExecRoleArn:
+    Type: String
+    Default: ""
+    Description: "ARN of IAM role with ssm:SendCommand for restricted repair (defaults to RemediationOperatorRole)"
+
+  SlackChannel:
+    Type: String
+    Default: "#incidents-alerts"
+
+  SlackApprovalChannel:
+    Type: String
+    Default: "#incidents-approval"
+
+# ── Conditions ────────────────────────────────────────────────────────────────
+
+Conditions:
+  ShouldCreateDynamoTables: !Equals [!Ref CreateDynamoTables, "true"]
+  ShouldCreateBlobsBucket:  !Equals [!Ref CreateBlobsBucket, "true"]
+  ShouldCreateSsmDocuments: !Equals [!Ref CreateSsmDocuments, "true"]
+  ShouldCreateCoreIamRoles: !Equals [!Ref CreateCoreIamRoles, "true"]
+  HasTargetInstance:        !Not [!Equals [!Ref TargetInstanceId, ""]]
+  ShouldCreateAlarms:       !And [!Equals [!Ref EnableAlarms, "true"], !Condition HasTargetInstance]
+  ShouldCreateDiskAlarm:    !And [!Equals [!Ref EnableDiskAlarm, "true"], !Condition HasTargetInstance]
+  HasSsmExecRole:           !Not [!Equals [!Ref SsmExecRoleArn, ""]]
+  HasSlackBotSecret:        !Not [!Equals [!Ref SlackBotTokenSecretArn, ""]]
+  HasSlackSigningSecret:    !Not [!Equals [!Ref SlackSigningSecretArn, ""]]
+  HasCustomBlobsBucket:     !Not [!Equals [!Ref ExistingBlobsBucketName, ""]]
+
+# ── Globals ───────────────────────────────────────────────────────────────────
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    CodeUri: ./
+    Handler: handlers.ingest.handler
+    Environment:
+      Variables:
+        EVENTS_TABLE:        !If [ShouldCreateDynamoTables, !Ref EventsTable, "incidents-events"]
+        DEDUP_TABLE:         !If [ShouldCreateDynamoTables, !Ref DedupTable, "incidents-dedup"]
+        LEASES_TABLE:        !If [ShouldCreateDynamoTables, !Ref LeasesTable, "incidents-leases"]
+        BLOBS_BUCKET:        !If [ShouldCreateBlobsBucket, !Ref BlobsBucket, !If [HasCustomBlobsBucket, !Ref ExistingBlobsBucketName, !Sub "incidents-blobs-${AWS::AccountId}"]]
+        AGENT_FUNCTION:      incidents-agent
+        OBSERVER_FUNCTION:   incidents-observer
+        EXECUTOR_FUNCTION:   incidents-executor
+        NOTIFIER_FUNCTION:   incidents-notifier
+        TARGET_INSTANCE_ID:  !Ref TargetInstanceId
+        NOVA_FLASH_MODEL_ID: !Ref NovaFlashModelId
+        NOVA_PRO_MODEL_ID:   !Ref NovaProModelId
+        STRANDS_URL:         !Ref StrandsUrl
+        DEEPSEEK_BASE_URL:   !Ref DeepSeekBaseUrl
+        DEEPSEEK_FLASH_MODEL: !Ref DeepSeekFlashModel
+        DEEPSEEK_PRO_MODEL:  !Ref DeepSeekProModel
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+
+Resources:
+
+  # ── DynamoDB ──────────────────────────────────────────────────────────────
+
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Condition: ShouldCreateDynamoTables
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: incidents-events
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: incident_id
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: incident_id
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  DedupTable:
+    Type: AWS::DynamoDB::Table
+    Condition: ShouldCreateDynamoTables
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: incidents-dedup
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: dedupe_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: dedupe_key
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  LeasesTable:
+    Type: AWS::DynamoDB::Table
+    Condition: ShouldCreateDynamoTables
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: incidents-leases
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: incident_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: incident_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_epoch
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ── S3 ────────────────────────────────────────────────────────────────────
+
+  BlobsBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateBlobsBucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "incidents-blobs-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Suspended
+      LifecycleConfiguration:
+        Rules:
+          - Id: delete-old-blobs
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── Zero-Trust SSM Documents ──────────────────────────────────────────────
+
+  ObserveReadOnlyDocument:
+    Type: AWS::SSM::Document
+    Condition: ShouldCreateSsmDocuments
+    Properties:
+      Name: incidents-observe-readonly
+      DocumentType: Command
+      UpdateMethod: NewVersion
+      Content:
+        schemaVersion: "2.2"
+        description: "Read-only observation — no modification allowed"
+        parameters:
+          command:
+            type: String
+            allowedPattern: "^(sudo )?(df|du|free|top|ps|cat|head|tail|ls|stat|find|systemctl|journalctl|dmesg|uptime|netstat|ss|lsof|wc|grep|curl|pgrep|mpstat|vmstat|pidstat|echo|date|id|whoami|uname|hostname).*"
+            description: "Read-only command (allowlist enforced)"
+        mainSteps:
+          - action: aws:runShellScript
+            name: runObservation
+            inputs:
+              runCommand:
+                - "{{ command }}"
+              timeoutSeconds: "60"
+
+  RepairRestrictedDocument:
+    Type: AWS::SSM::Document
+    Condition: ShouldCreateSsmDocuments
+    Properties:
+      Name: incidents-repair-restricted
+      DocumentType: Command
+      UpdateMethod: NewVersion
+      Content:
+        schemaVersion: "2.2"
+        description: "Restricted repair operations — allowlist enforced"
+        parameters:
+          command:
+            type: String
+            allowedPattern: "^(sudo )?(systemctl restart|systemctl start|systemctl stop|systemctl reload|rm -f|truncate|mv|cp|kill|pkill).*"
+            description: "Restricted repair command (allowlist enforced)"
+        mainSteps:
+          - action: aws:runShellScript
+            name: runRepair
+            inputs:
+              runCommand:
+                - "{{ command }}"
+              timeoutSeconds: "120"
+
+  # ── IAM Roles ─────────────────────────────────────────────────────────────
+
+  IngestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: incidents-ingest-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: incidents-ingest-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EventsTableAppendOnly
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-events"
+              - Sid: MutableOperationalTables
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-leases"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-dedup"
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-agent"
+
+  AgentRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldCreateCoreIamRoles
+    Properties:
+      RoleName: incidents-agent-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: incidents-agent-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EventsTableAppendOnly
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-events"
+              - Sid: MutableOperationalTables
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-leases"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-dedup"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::incidents-blobs-${AWS::AccountId}/*"
+              # Note: Foundation Model / LLM inference is decoupled from template.yaml.
+              # All inference requests use HTTPS Bearer API Key authentication against an OpenAI-compatible
+              # endpoint (e.g. Amazon Bedrock QuickStart / Mantle or external provider) with secrets stored
+              # locally in AWS Secrets Manager (${AWS::Region}). No cross-region bedrock:InvokeModel IAM
+              # policies are required, preventing Service Control Policy (SCP) denials in restricted regions (e.g. eu-north-1).
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/incidents/*"
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-observer"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-executor"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-notifier"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-agent"
+
+  ObserverRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldCreateCoreIamRoles
+    Properties:
+      RoleName: incidents-observer-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: incidents-observer-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/incidents-observe-readonly"
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+              - Effect: Allow
+                Action: ssm:GetCommandInvocation
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:DescribeAlarms
+                  - logs:FilterLogEvents
+                  - logs:DescribeLogGroups
+                Resource: "*"
+              - Sid: EventsTableAppendOnly
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-events"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::incidents-blobs-${AWS::AccountId}/*"
+
+  ExecutorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: incidents-executor-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: incidents-executor-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EventsTableAppendOnly
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-events"
+              - Sid: MutableOperationalTables
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-leases"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-dedup"
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !If
+                  - HasSsmExecRole
+                  - !Ref SsmExecRoleArn
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/RemediationOperatorRole"
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-notifier"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/incidents/*"
+
+  RemediationOperatorRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldCreateCoreIamRoles
+    Properties:
+      RoleName: RemediationOperatorRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt ExecutorRole.Arn
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RemediationOperatorRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RestrictedRepairOnTaggedInstance
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    "ssm:resourceTag/IncidentsAgent": "true"
+              - Sid: AllowOnlyRestrictedRepairDocument
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/incidents-repair-restricted"
+              - Sid: GetCommandResults
+                Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommands
+                Resource: "*"
+
+  NotifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: incidents-notifier-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: incidents-notifier-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/incidents/*"
+
+  SlackCallbackRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: incidents-slack-callback-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: incidents-slack-callback-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/incidents/*"
+              - Sid: EventsTableAppendOnly
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-events"
+              - Sid: MutableOperationalTables
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-leases"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-dedup"
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-agent"
+
+  # ── Lambda Functions ──────────────────────────────────────────────────────
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: incidents-ingest
+      Handler: handlers.ingest.handler
+      Role: !GetAtt IngestRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Events:
+        AlarmStateChangeRule:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: ["aws.cloudwatch"]
+              detail-type: ["CloudWatch Alarm State Change"]
+              detail:
+                state:
+                  value: ["ALARM"]
+
+  AgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: incidents-agent
+      Handler: handlers.agent.handler
+      Role: !If [ShouldCreateCoreIamRoles, !GetAtt AgentRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/incidents-agent-role"]
+      MemorySize: 512
+      Timeout: 900
+      Environment:
+        Variables:
+          SAFETY_MARGIN_SECONDS: "30"
+          MAX_CYCLES:            "20"
+          LEASE_TTL_SECONDS:     "900"
+          DEEPSEEK_SECRET_ARN:   "/incidents/deepseek-api-key"
+          DEEPSEEK_BASE_URL:     !Ref DeepSeekBaseUrl
+          DEEPSEEK_FLASH_MODEL:  !Ref DeepSeekFlashModel
+          DEEPSEEK_PRO_MODEL:    !Ref DeepSeekProModel
+
+  ObserverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: incidents-observer
+      Handler: handlers.observer.handler
+      Role: !If [ShouldCreateCoreIamRoles, !GetAtt ObserverRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/incidents-observer-role"]
+      MemorySize: 256
+      Timeout: 90
+      Environment:
+        Variables:
+          SSM_DOC_OBSERVE: "incidents-observe-readonly"
+
+  ExecutorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: incidents-executor
+      Handler: handlers.executor_fn.handler
+      Role: !GetAtt ExecutorRole.Arn
+      MemorySize: 256
+      Timeout: 300
+      Environment:
+        Variables:
+          SSM_EXEC_ROLE_ARN: !If
+            - HasSsmExecRole
+            - !Ref SsmExecRoleArn
+            - !Sub "arn:aws:iam::${AWS::AccountId}:role/RemediationOperatorRole"
+          APPROVAL_MAC_KEY_SECRET_ARN: "/incidents/approval-mac-key"
+          APPROVAL_MAC_KEY_HEX:        !Ref ApprovalMacKeyHex
+          MAX_VERIFY_ATTEMPTS:         "2"
+
+  NotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: incidents-notifier
+      Handler: handlers.notifier.handler
+      Role: !GetAtt NotifierRole.Arn
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          SLACK_CHANNEL:              !Ref SlackChannel
+          SLACK_APPROVAL_CHANNEL:     !Ref SlackApprovalChannel
+          SLACK_BOT_TOKEN_SECRET_ARN: !If
+            - HasSlackBotSecret
+            - !Ref SlackBotTokenSecretArn
+            - "/incidents/slack-bot-token"
+          SLACK_WEBHOOK_SECRET_ARN:   "/incidents/slack-webhook-url"
+
+
+  SlackCallbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: incidents-slack-callback
+      Handler: handlers.slack_callback.handler
+      Role: !GetAtt SlackCallbackRole.Arn
+      MemorySize: 128
+      Timeout: 10
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: ["https://slack.com"]
+          AllowMethods: ["POST"]
+      Environment:
+        Variables:
+          SLACK_SIGNING_SECRET_ARN: !If
+            - HasSlackSigningSecret
+            - !Ref SlackSigningSecretArn
+            - "/incidents/slack-signing-secret"
+          APPROVAL_MAC_KEY_SECRET_ARN:           "/incidents/approval-mac-key"
+          APPROVAL_MAC_KEY_HEX:                  !Ref ApprovalMacKeyHex
+          SLACK_AUTHORIZED_APPROVERS:            !Ref SlackAuthorizedApprovers
+          SLACK_AUTHORIZED_APPROVERS_SECRET_ARN: "/incidents/slack-authorized-approvers"
+
+  # ── CloudWatch Alarms ─────────────────────────────────────────────────────
+
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlarms
+    Properties:
+      AlarmName: !Sub "High-CPU-${TargetInstanceId}"
+      AlarmDescription: "Triggers autonomous agent investigation when CPU exceeds 85%"
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref TargetInstanceId
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  StatusCheckFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlarms
+    Properties:
+      AlarmName: !Sub "StatusCheckFailed-${TargetInstanceId}"
+      AlarmDescription: "Triggers autonomous agent investigation when instance status check fails"
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref TargetInstanceId
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  HighDiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateDiskAlarm
+    Properties:
+      AlarmName: !Sub "High-Disk-${TargetInstanceId}"
+      AlarmDescription: "Triggers autonomous agent investigation when root disk usage exceeds 85%"
+      Namespace: CWAgent
+      MetricName: disk_used_percent
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref TargetInstanceId
+        - Name: path
+          Value: "/"
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+
+Outputs:
+  EventsTableName:
+    Value: !If [ShouldCreateDynamoTables, !Ref EventsTable, "incidents-events"]
+    Description: "DynamoDB table for incident events (incidents-events)"
+
+  DedupTableName:
+    Value: !If [ShouldCreateDynamoTables, !Ref DedupTable, "incidents-dedup"]
+    Description: "DynamoDB table for deduplication (incidents-dedup)"
+
+  LeasesTableName:
+    Value: !If [ShouldCreateDynamoTables, !Ref LeasesTable, "incidents-leases"]
+    Description: "DynamoDB table for worker leases (incidents-leases)"
+
+  BlobsBucketName:
+    Value: !If [ShouldCreateBlobsBucket, !Ref BlobsBucket, !If [HasCustomBlobsBucket, !Ref ExistingBlobsBucketName, !Sub "incidents-blobs-${AWS::AccountId}"]]
+    Description: "S3 bucket for large blobs > 300KB"
+
+  ObserveReadOnlyDocumentName:
+    Value: "incidents-observe-readonly"
+    Description: "Zero-Trust SSM observation document (T0 allowlist)"
+
+  RepairRestrictedDocumentName:
+    Value: "incidents-repair-restricted"
+    Description: "Zero-Trust SSM restricted repair document (T1 allowlist)"
+
+  IngestFunctionArn:
+    Value: !GetAtt IngestFunction.Arn
+
+  AgentFunctionArn:
+    Value: !GetAtt AgentFunction.Arn
+
+  ObserverFunctionArn:
+    Value: !GetAtt ObserverFunction.Arn
+
+  ExecutorFunctionArn:
+    Value: !GetAtt ExecutorFunction.Arn
+
+  NotifierFunctionArn:
+    Value: !GetAtt NotifierFunction.Arn
+
+  SlackCallbackFunctionArn:
+    Value: !GetAtt SlackCallbackFunction.Arn
+
+  SlackCallbackUrl:
+    Description: "Configure this URL in Slack App → Interactivity & Shortcuts → Request URL"
+    Value: !GetAtt SlackCallbackFunctionUrl.FunctionUrl

@@ -1,0 +1,58 @@
+{
+  "incident_id": "inc-test",
+  "instance_id": "",
+  "phase": "unknown",
+  "total_events": 4,
+  "evidence": [
+    {
+      "evidence_id": "01TESTEVID0000000000000000",
+      "source": "observation:df -h",
+      "summary": "Filesystem /dev/root size=20G used=18G (90%)",
+      "trust": "host_reported",
+      "timestamp": "2026-10-20T00:00:00Z",
+      "seq": 1
+    }
+  ],
+  "hypotheses": [
+    {
+      "hypothesis_id": "H1",
+      "statement": "Root filesystem full due to cache bloat",
+      "status": "confirmed",
+      "confidence": 0.95,
+      "supporting": [
+        "01TESTEVID0000000000000000"
+      ],
+      "contradicting": [],
+      "trigger_evidence_id": "01TESTEVID0000000000000000",
+      "seq": 2
+    }
+  ],
+  "proposed_steps": [
+    {
+      "step_id": "step-01",
+      "kind": "mutate",
+      "command": "truncate -s 0 /var/cache/app_spool/orphaned_export_55gb.dat",
+      "target": "file",
+      "based_on_evidence": [
+        "01TESTEVID0000000000000000"
+      ],
+      "based_on_hypotheses": [
+        "H1"
+      ],
+      "risk_claim": "low risk",
+      "seq": 3
+    }
+  ],
+  "policy_decisions": [
+    {
+      "step_id": "step-01",
+      "tier": "T1",
+      "decision": "allow",
+      "reasons": [
+        "Auto-allowed T1 remediation"
+      ],
+      "seq": 4
+    }
+  ],
+  "generated_at": "2026-10-21T19:07:22.136018+00:00"
+}

@@ -1,0 +1,17 @@
+{
+  "incident_id": "inc-test-denial",
+  "instance_id": "i-test001",
+  "phase": "escalated",
+  "total_events": 2,
+  "evidence": [],
+  "hypotheses": [],
+  "proposed_steps": [],
+  "policy_decisions": [],
+  "generated_at": "2026-10-21T19:07:00.316653+00:00",
+  "escalation": {
+    "reason": "Step step-t2 was explicitly denied by <@U_SECOPS_CHIEF> via Slack.",
+    "report_ref": "reports/incident_inc-test-denial.json",
+    "actor": "system",
+    "seq": 0
+  }
+}
