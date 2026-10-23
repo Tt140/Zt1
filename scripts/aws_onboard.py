@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -119,6 +120,7 @@ class IAMRoleReport:
     name: str
     exists: bool
     arn: Optional[str]
+    trust_valid: bool = True
 
 
 @dataclass
@@ -480,16 +482,22 @@ def audit_iam_roles(session: boto3.Session) -> IAMLayerReport:
     for rname in required_roles:
         try:
             r = iam.get_role(RoleName=rname)["Role"]
+            trust_doc = r.get("AssumeRolePolicyDocument")
+            trust_valid = _is_trust_policy_valid(rname, trust_doc)
             roles_report[rname] = IAMRoleReport(
                 name=rname,
                 exists=True,
                 arn=r["Arn"],
+                trust_valid=trust_valid,
             )
+            if not trust_valid:
+                all_ready = False
         except ClientError:
             roles_report[rname] = IAMRoleReport(
                 name=rname,
                 exists=False,
                 arn=None,
+                trust_valid=False,
             )
             all_ready = False
 
@@ -991,10 +999,22 @@ def build_cfn_parameters(
         params["CreateSsmDocuments"] = "true"
 
     # 7. IAM Core Roles
+    any_iam_role_exists = any(r.exists for r in report.iam.roles.values())
     if report.iam.all_ready:
+        params["CreateCoreIamRoles"] = "false"
+    elif is_apply and any_iam_role_exists:
+        # Reconciled in-place during apply to prevent CloudFormation EntityAlreadyExists errors
+        params["CreateCoreIamRoles"] = "false"
+    elif any_iam_role_exists:
         params["CreateCoreIamRoles"] = "false"
     else:
         params["CreateCoreIamRoles"] = "true"
+
+    for rname, rinfo in report.iam.roles.items():
+        if rinfo.exists and not getattr(rinfo, "trust_valid", True):
+            pre_actions.append(
+                f"Reconcile IAM Role Trust Policy ({rname}): Role exists but lacks proper trust relationship for service execution. '--mode apply' will automatically reconcile it."
+            )
 
     # 8. Alarms
     if report.ec2.target_valid or create_target_vps:
@@ -1823,6 +1843,280 @@ systemctl enable --now cwsys_health.timer || true
     return instance_id
 
 
+# ── Core IAM Roles Reconciliation Engine ─────────────────────────────────────
+
+def _is_trust_policy_valid(role_name: str, doc: Any) -> bool:
+    if not doc:
+        return False
+    if isinstance(doc, str):
+        try:
+            if "%" in doc:
+                doc = urllib.parse.unquote(doc)
+            doc = json.loads(doc)
+        except Exception:
+            return False
+    if not isinstance(doc, dict):
+        return False
+
+    expected_principal = "lambda.amazonaws.com"
+    if role_name == "RemediationOperatorRole":
+        expected_principal = None
+
+    statements = doc.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+
+    for stmt in statements:
+        if not isinstance(stmt, dict):
+            continue
+        if stmt.get("Effect") != "Allow":
+            continue
+        actions = stmt.get("Action", [])
+        if isinstance(actions, str):
+            actions = [actions]
+        if not any("sts:assumerole" in str(a).lower() or a == "*" for a in actions):
+            continue
+
+        if expected_principal is None:
+            return True
+
+        principal = stmt.get("Principal", {})
+        if isinstance(principal, dict):
+            services = principal.get("Service", [])
+            if isinstance(services, str):
+                services = [services]
+            if any(expected_principal in str(s).lower() for s in services):
+                return True
+        elif principal == "*":
+            return True
+
+    return False
+
+
+def ensure_core_iam_roles(session: boto3.Session, account_id: str, region: str) -> List[str]:
+    """
+    Reconciles core IAM roles (incidents-agent-role, incidents-observer-role, RemediationOperatorRole)
+    if they exist in the AWS account:
+    1. Guarantees assume role trust policy allows lambda.amazonaws.com (prevents Lambda AccessDeniedException).
+    2. Attaches AWSLambdaBasicExecutionRole managed policy.
+    3. Reconciles exact least-privilege inline policies for DynamoDB, SSM, S3, SecretsManager, and Lambda.
+    """
+    reg = region or session.region_name or "us-east-1"
+    iam = session.client("iam", region_name=reg)
+    remediated: List[str] = []
+
+    lambda_trust = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "lambda.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+
+    # 1. incidents-agent-role
+    agent_role_name = "incidents-agent-role"
+    try:
+        r = iam.get_role(RoleName=agent_role_name)["Role"]
+        if not _is_trust_policy_valid(agent_role_name, r.get("AssumeRolePolicyDocument")):
+            iam.update_assume_role_policy(
+                RoleName=agent_role_name,
+                PolicyDocument=json.dumps(lambda_trust),
+            )
+            remediated.append(f"Reconciled trust policy for '{agent_role_name}' to allow lambda.amazonaws.com")
+
+        iam.attach_role_policy(
+            RoleName=agent_role_name,
+            PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+        )
+
+        agent_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "EventsTableAppendOnly",
+                    "Effect": "Allow",
+                    "Action": [
+                        "dynamodb:GetItem",
+                        "dynamodb:PutItem",
+                        "dynamodb:UpdateItem",
+                        "dynamodb:Query",
+                        "dynamodb:DescribeTable",
+                    ],
+                    "Resource": f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-events",
+                },
+                {
+                    "Sid": "MutableOperationalTables",
+                    "Effect": "Allow",
+                    "Action": [
+                        "dynamodb:GetItem",
+                        "dynamodb:PutItem",
+                        "dynamodb:UpdateItem",
+                        "dynamodb:DeleteItem",
+                        "dynamodb:Query",
+                        "dynamodb:DescribeTable",
+                    ],
+                    "Resource": [
+                        f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-leases",
+                        f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-dedup",
+                    ],
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject", "s3:PutObject"],
+                    "Resource": f"arn:aws:s3:::incidents-blobs-{account_id}/*",
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": "secretsmanager:GetSecretValue",
+                    "Resource": f"arn:aws:secretsmanager:{reg}:{account_id}:secret:/incidents/*",
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": "lambda:InvokeFunction",
+                    "Resource": [
+                        f"arn:aws:lambda:{reg}:{account_id}:function:incidents-observer",
+                        f"arn:aws:lambda:{reg}:{account_id}:function:incidents-executor",
+                        f"arn:aws:lambda:{reg}:{account_id}:function:incidents-notifier",
+                        f"arn:aws:lambda:{reg}:{account_id}:function:incidents-agent",
+                    ],
+                },
+            ],
+        }
+        iam.put_role_policy(
+            RoleName=agent_role_name,
+            PolicyName="incidents-agent-policy",
+            PolicyDocument=json.dumps(agent_policy),
+        )
+        remediated.append(f"Reconciled inline policy 'incidents-agent-policy' on '{agent_role_name}'")
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code != "NoSuchEntity":
+            print(f"  ⚠️ Warning: Failed reconciling {agent_role_name}: {exc}")
+
+    # 2. incidents-observer-role
+    observer_role_name = "incidents-observer-role"
+    try:
+        r = iam.get_role(RoleName=observer_role_name)["Role"]
+        if not _is_trust_policy_valid(observer_role_name, r.get("AssumeRolePolicyDocument")):
+            iam.update_assume_role_policy(
+                RoleName=observer_role_name,
+                PolicyDocument=json.dumps(lambda_trust),
+            )
+            remediated.append(f"Reconciled trust policy for '{observer_role_name}' to allow lambda.amazonaws.com")
+
+        iam.attach_role_policy(
+            RoleName=observer_role_name,
+            PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+        )
+
+        observer_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "ssm:SendCommand",
+                    "Resource": [
+                        f"arn:aws:ssm:{reg}:{account_id}:document/incidents-observe-readonly",
+                        f"arn:aws:ec2:{reg}:{account_id}:instance/*",
+                    ],
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": ["ssm:GetCommandInvocation", "ssm:ListCommands"],
+                    "Resource": "*",
+                },
+                {
+                    "Sid": "EventsTableAppendOnly",
+                    "Effect": "Allow",
+                    "Action": [
+                        "dynamodb:GetItem",
+                        "dynamodb:PutItem",
+                        "dynamodb:UpdateItem",
+                        "dynamodb:Query",
+                        "dynamodb:DescribeTable",
+                    ],
+                    "Resource": f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-events",
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject", "s3:PutObject"],
+                    "Resource": f"arn:aws:s3:::incidents-blobs-{account_id}/*",
+                },
+            ],
+        }
+        iam.put_role_policy(
+            RoleName=observer_role_name,
+            PolicyName="incidents-observer-policy",
+            PolicyDocument=json.dumps(observer_policy),
+        )
+        remediated.append(f"Reconciled inline policy 'incidents-observer-policy' on '{observer_role_name}'")
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code != "NoSuchEntity":
+            print(f"  ⚠️ Warning: Failed reconciling {observer_role_name}: {exc}")
+
+    # 3. RemediationOperatorRole
+    op_role_name = "RemediationOperatorRole"
+    try:
+        r = iam.get_role(RoleName=op_role_name)["Role"]
+        op_trust = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": f"arn:aws:iam::{account_id}:role/incidents-executor-role"},
+                    "Action": "sts:AssumeRole",
+                }
+            ],
+        }
+        if not _is_trust_policy_valid(op_role_name, r.get("AssumeRolePolicyDocument")):
+            iam.update_assume_role_policy(
+                RoleName=op_role_name,
+                PolicyDocument=json.dumps(op_trust),
+            )
+            remediated.append(f"Reconciled trust policy for '{op_role_name}' to allow incidents-executor-role")
+
+        op_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "RestrictedRepairOnTaggedInstance",
+                    "Effect": "Allow",
+                    "Action": "ssm:SendCommand",
+                    "Resource": f"arn:aws:ec2:{reg}:{account_id}:instance/*",
+                    "Condition": {"StringEquals": {"ssm:resourceTag/IncidentsAgent": "true"}},
+                },
+                {
+                    "Sid": "AllowOnlyRestrictedRepairDocument",
+                    "Effect": "Allow",
+                    "Action": "ssm:SendCommand",
+                    "Resource": f"arn:aws:ssm:{reg}:{account_id}:document/incidents-repair-restricted",
+                },
+                {
+                    "Sid": "GetCommandResults",
+                    "Effect": "Allow",
+                    "Action": ["ssm:GetCommandInvocation", "ssm:ListCommands"],
+                    "Resource": "*",
+                },
+            ],
+        }
+        iam.put_role_policy(
+            RoleName=op_role_name,
+            PolicyName="RemediationOperatorRolePolicy",
+            PolicyDocument=json.dumps(op_policy),
+        )
+        remediated.append(f"Reconciled inline policy 'RemediationOperatorRolePolicy' on '{op_role_name}'")
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code != "NoSuchEntity":
+            print(f"  ⚠️ Warning: Failed reconciling {op_role_name}: {exc}")
+
+    return remediated
+
+
 # ── Pre-Deploy Execution Engine ──────────────────────────────────────────────
 
 def execute_pre_deploy_actions(
@@ -2082,12 +2376,21 @@ def run_apply_mode(
         if telemetry_ok:
             report.ec2.has_cwagent_disk_metrics = True
 
+    # 3.4 Bootstrap & Reconcile Core IAM Roles (incidents-agent-role, incidents-observer-role, RemediationOperatorRole)
+    print("  🛡️ Reconciling Core IAM Roles (trust policies & execution permissions)...")
+    iam_reconciled = ensure_core_iam_roles(session=session, account_id=report.identity.account_id, region=region)
+    for act in iam_reconciled:
+        print(f"  ✓ {act}")
+
     executed_actions = execute_pre_deploy_actions(
         session=session,
         region=region,
         report=report,
         project_root=project_root,
     )
+    for act in iam_reconciled:
+        if act not in executed_actions:
+            executed_actions.append(act)
     for act in secret_results:
         if act not in executed_actions:
             executed_actions.append(act)

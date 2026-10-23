@@ -45,6 +45,8 @@ from scripts.aws_onboard import (
     print_llm_bedrock_policy,
     probe_strands_health,
     run_full_audit,
+    _is_trust_policy_valid,
+    ensure_core_iam_roles,
 )
 
 
@@ -1565,6 +1567,115 @@ class TestAwsOnboardPlanner:
         assert "amazon-cloudwatch-agent" in script_sent
         assert "cwsys_health.timer" in script_sent
         assert "FailedServicesCount" in script_sent
+
+
+class TestCoreIamRolesReconciliation:
+    """
+    Tests for Core IAM Roles Trust Policy Auditing and In-Place Auto-Reconciliation.
+    Prevents AWS Lambda fatal error:
+    'AccessDeniedException: The role defined for the function cannot be assumed by Lambda.'
+    """
+
+    def test_trust_policy_validation(self):
+        valid_lambda = {
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Service": "lambda.amazonaws.com"},
+                "Action": "sts:AssumeRole"
+            }]
+        }
+        invalid_ec2 = {
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Service": "ec2.amazonaws.com"},
+                "Action": "sts:AssumeRole"
+            }]
+        }
+        valid_operator = {
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"AWS": "arn:aws:iam::111122223333:role/incidents-executor-role"},
+                "Action": "sts:AssumeRole"
+            }]
+        }
+
+        assert _is_trust_policy_valid("incidents-agent-role", valid_lambda) is True
+        assert _is_trust_policy_valid("incidents-agent-role", invalid_ec2) is False
+        assert _is_trust_policy_valid("incidents-agent-role", {}) is False
+        assert _is_trust_policy_valid("incidents-agent-role", None) is False
+        assert _is_trust_policy_valid("RemediationOperatorRole", valid_operator) is True
+
+    def test_ensure_core_iam_roles_reconciles_invalid_trust_and_policies(self):
+        mock_session = MagicMock()
+        mock_iam = MagicMock()
+        mock_session.client.return_value = mock_iam
+        mock_session.region_name = "us-east-1"
+
+        # Mock existing role with incorrect EC2 trust policy
+        mock_iam.get_role.return_value = {
+            "Role": {
+                "RoleName": "incidents-agent-role",
+                "Arn": "arn:aws:iam::111122223333:role/incidents-agent-role",
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": {"Service": "ec2.amazonaws.com"},
+                        "Action": "sts:AssumeRole"
+                    }]
+                }
+            }
+        }
+
+        remediated = ensure_core_iam_roles(mock_session, account_id="111122223333", region="us-east-1")
+        assert len(remediated) >= 2
+        assert any("Reconciled trust policy for 'incidents-agent-role'" in r for r in remediated)
+
+        # Verify update_assume_role_policy was called with lambda.amazonaws.com
+        update_calls = [c for c in mock_iam.update_assume_role_policy.call_args_list if c[1]["RoleName"] == "incidents-agent-role"]
+        assert len(update_calls) == 1
+        doc = json.loads(update_calls[0][1]["PolicyDocument"])
+        assert doc["Statement"][0]["Principal"]["Service"] == "lambda.amazonaws.com"
+
+        # Verify AWSLambdaBasicExecutionRole was attached
+        mock_iam.attach_role_policy.assert_any_call(
+            RoleName="incidents-agent-role",
+            PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+        )
+
+        # Verify inline policy was put
+        mock_iam.put_role_policy.assert_any_call(
+            RoleName="incidents-agent-role",
+            PolicyName="incidents-agent-policy",
+            PolicyDocument=mock_iam.put_role_policy.call_args_list[0][1]["PolicyDocument"],
+        )
+
+    def test_build_cfn_parameters_reports_iam_trust_reconciliation_action(self):
+        ident = _make_identity()
+        ec2 = _make_ec2_report(has_security_tag=True, has_cwagent_disk=True)
+        ddb = _make_dynamodb_report(all_ready=True)
+        s3 = _make_s3_report(exists=True)
+        ssm = _make_ssm_report(all_ready=True)
+        secrets_rep = _make_secrets_report(all_exist=True)
+        stack = _make_stack_report()
+
+        roles = {
+            "incidents-agent-role": IAMRoleReport("incidents-agent-role", True, "arn:aws:iam::111:role/agent", trust_valid=False),
+            "incidents-observer-role": IAMRoleReport("incidents-observer-role", True, "arn:aws:iam::111:role/observer", trust_valid=True),
+            "RemediationOperatorRole": IAMRoleReport("RemediationOperatorRole", True, "arn:aws:iam::111:role/operator", trust_valid=True),
+        }
+        iam = IAMLayerReport(roles=roles, all_ready=False)
+
+        report = AuditReport(
+            identity=ident, ec2=ec2, dynamodb=ddb, s3=s3, ssm=ssm,
+            iam=iam, secrets=secrets_rep, stack=stack, overall_status="READY",
+        )
+
+        params, pre_actions, _ = build_cfn_parameters(report)
+        assert any("Reconcile IAM Role Trust Policy (incidents-agent-role)" in a for a in pre_actions)
 
 
 
