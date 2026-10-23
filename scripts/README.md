@@ -126,6 +126,21 @@ Traditional monitoring scripts either fail on distributions lacking `cronie` (su
   $$\text{Failed Services} = \text{failed units count} + \text{enabled but inactive critical daemons count}$$
   This emits `FailedServicesCount` directly to the `CWAgent` CloudWatch namespace, guaranteeing that both unhandled application crashes and stopped services trigger an immediate `ALARM` state within 60 seconds.
 
+### 6. Universal OS & Workload Compatibility Matrix (Quiet Engineering Flex)
+`aws_onboard.py` was architected to be the ultimate non-intrusive onboarding engine for enterprise AWS accounts. It requires **zero changes** to existing client application architectures:
+
+| Target Operating System | Detection & In-Place Bootstrap Mechanism | Workload & Process Coverage |
+| :--- | :--- | :--- |
+| **Ubuntu 20.04 / 22.04 / 24.04 LTS** | Automatic `apt-get` detection + official AWS `.deb` fallback | Any systemd service (`docker`, `nginx`, `node`, `pm2`, `python`) |
+| **Debian 11 / 12** | Universal Debian package manager detection + IMDSv2 token security | Core daemons, web servers, databases (`postgres`, `redis`, `mysql`) |
+| **Amazon Linux 2023 / 2** | Native `dnf` / `yum` package resolution + CloudWatch agent integration | Microservices, enterprise apps, Java, Go, container runtimes |
+| **RHEL 8 / 9 & Rocky Linux** | RPM-based architecture inspection + systemd timer daemon | Heavy enterprise workloads, SAP, database clusters, custom daemons |
+
+#### Why This Is an Engineering Flex:
+1. **Zero Client Compromises**: The client doesn't have to launch a new EC2 instance, change their AMI, or configure SSH keys. Everything is governed through IAM and AWS Systems Manager.
+2. **Zero Downtime**: The telemetry injection, CWAgent daemon start, and systemd timer enablement run in milliseconds in the background without restarting the instance or interrupting active TCP connections.
+3. **Fail-Safe Decoupling**: In `template.yaml`, `SystemDegradedAlarm` is decoupled from disk metrics. Even before disk metrics are collected, CloudFormation deploys `SystemDegradedAlarm`, `High-CPU`, and `StatusCheckFailed` immediately, guaranteeing immediate protection.
+
 ---
 
 ## 5. CLI Reference & Command Examples

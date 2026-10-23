@@ -188,11 +188,30 @@ The system eliminates brittle distro-specific or application-specific monitoring
 * **`High-Disk` (CWAgent)**: Root filesystem consumption > 85% with unified `"aggregation_dimensions": [["InstanceId"]]` to eliminate device name fragmentation (`nvme` vs `xvda`).
 * **`High-Memory` (CWAgent)**: Physical RAM pressure > 85% to mitigate OOM kills before system crash.
 * **`System-Degraded` (CWAgent)**: Generic service failure alarm driven by a native **Linux Systemd Timer** (`cwsys_health.timer`) running every 60s via IMDSv2. Detects both abnormal process crashes (`systemctl --failed`) AND stopped enabled critical services (`! is-active`) with zero `cron`/`cronie` dependency across Ubuntu, Debian, AL2023, and RHEL.
+* **Architectural Decoupling**: Crucially, `SystemDegradedAlarm` is **100% decoupled** from disk metrics in `template.yaml` (`Condition: ShouldCreateAlarms`), guaranteeing that daemon crashes and dead services trigger immediate self-healing on any server regardless of disk telemetry status.
 
 ### 5. Omni-Ingestion Sentinel Layer (`handlers/ingest.py`)
 `incidents-ingest` operates as a decoupled, multi-source ingestion sentinel:
 * Parses CloudWatch alarm state transitions via EventBridge with zero reliance on alarm naming conventions.
 * Extracts the target instance directly from `configuration.metrics[*].metricStat.metric.dimensions`, allowing custom enterprise alarms (`Prod-API-Down`, `Payment-Gateway-Failure`) to seamlessly route to the autonomous agent.
+
+### 6. Universal Workload & Distro-Agnostic Masterclass (Quiet Engineering Flex)
+Most automated SRE tools break when confronted with real-world enterprise infrastructure: they mandate custom golden AMIs, reboot running instances, rely on specific package managers, or only monitor pre-configured web servers. 
+
+This platform was engineered from first principles to be **100% non-intrusive, workload-agnostic, and distro-agnostic**:
+* **Universal Distro Agnosticism**: Functions out of the box across **Ubuntu (20.04/22.04/24.04), Debian (11/12), Amazon Linux 2023/2, RHEL (8/9), Rocky Linux, and CentOS**. The onboarding engine dynamically inspects package managers (`dnf`, `yum`, `apt-get`) and falls back to architecture-aware official AWS binaries if needed.
+* **Workload-Agnostic Process Sentinel**: Operates universally across **Docker, Nginx, Node.js, Python/Gunicorn, Go, PM2, PostgreSQL, MySQL, Redis**, or any custom systemd daemon.
+* **Zero-Downtime Brownfield In-Place Bootstrap**: Adopting an existing production server (`--instance-id <ID>`) executes entirely in-place via AWS SSM RunCommand. **No reboots, no downtime, and zero disruption to live customer traffic**. The CLI inspects existing IAM profiles, safely attaches `CloudWatchAgentServerPolicy`, deploys the native systemd timer, and immediately activates the full 5-alarm production suite.
+* **SCP-Immune Regional Independence**: By decoupling generative reasoning from cross-region IAM policies and leveraging BYOK HTTPS Bearer authentication via AWS Secrets Manager, the system operates seamlessly in restricted regions (such as `eu-north-1`) where Service Control Policies (SCPs) strictly block foundation model API activations.
+
+| Architectural Dimension | Legacy / Typical Agent Approach | Autonomous Zero-Trust Sentinel (Our IaC) |
+| :--- | :--- | :--- |
+| **Client Server Adoption** | Demands newly baked AMIs, agent rebuilds, or server restarts | **Zero-Downtime In-Place Bootstrap** via AWS SSM on any live server |
+| **Linux Distribution Scope** | Hardcoded for Amazon Linux or single package manager | **100% Multi-Distro Agnostic** (Ubuntu, Debian, AL2023/2, RHEL, Rocky) |
+| **Service Crash Detection** | Brittle `cron` jobs or hardcoded scripts for specific processes | **Universal Native Systemd Timer Pulse** (Dual-detects crashes & clean stops) |
+| **Disk Device Fragmentation** | Alarms break across instance types (`nvme0n1p1` vs `xvda1`) | **Unified Aggregation Dimensions** (`aggregation_dimensions: [["InstanceId"]]`) |
+| **Alarm Decoupling** | Service degradation suppressed if disk metrics absent | **Fully Decoupled `SystemDegradedAlarm`** evaluating 100% independently |
+| **Regional SCP & IAM Constraints** | Cross-region IAM roles triggering SCP `AccessDenied` | **SCP-Immune BYOK Architecture** with zero cross-region dependencies |
 
 ---
 
