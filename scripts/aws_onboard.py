@@ -2014,17 +2014,31 @@ def _is_trust_policy_valid(role_name: str, doc: Any) -> bool:
     return False
 
 
-def ensure_core_iam_roles(session: boto3.Session, account_id: str, region: str) -> List[str]:
+def ensure_core_iam_roles(
+    session: boto3.Session,
+    account_id: str,
+    region: str,
+    propagation_delay: int = 12,
+) -> List[str]:
     """
-    Reconciles core IAM roles (incidents-agent-role, incidents-observer-role, RemediationOperatorRole)
-    if they exist in the AWS account:
-    1. Guarantees assume role trust policy allows lambda.amazonaws.com (prevents Lambda AccessDeniedException).
-    2. Attaches AWSLambdaBasicExecutionRole managed policy.
-    3. Reconciles exact least-privilege inline policies for DynamoDB, SSM, S3, SecretsManager, and Lambda.
+    Ensures core IAM roles exist and are fully configured:
+    1. incidents-agent-role
+    2. incidents-observer-role
+    3. incidents-ingest-role
+    4. incidents-executor-role
+    5. RemediationOperatorRole
+
+    Idempotent lifecycle:
+    - If role does not exist (NoSuchEntity), creates it via iam.create_role with valid trust policy.
+    - If role exists, validates assume role trust policy and updates via iam.update_assume_role_policy if invalid.
+    - Attaches required managed policies (AWSLambdaBasicExecutionRole, AmazonSSMReadOnlyAccess).
+    - Injects least-privilege inline policies with wildcard lambda:InvokeFunction on 'incidents-*'.
+    - If any role was created or trust policy updated, waits propagation_delay seconds for AWS STS eventual consistency.
     """
     reg = region or session.region_name or "us-east-1"
     iam = session.client("iam", region_name=reg)
     remediated: List[str] = []
+    roles_mutated = False
 
     lambda_trust = {
         "Version": "2012-10-17",
@@ -2037,203 +2051,348 @@ def ensure_core_iam_roles(session: boto3.Session, account_id: str, region: str) 
         ],
     }
 
+    operator_trust = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": f"arn:aws:iam::{account_id}:role/incidents-executor-role"},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+
+    def _ensure_role_and_trust(role_name: str, trust_doc: dict) -> bool:
+        nonlocal roles_mutated
+        try:
+            r = iam.get_role(RoleName=role_name)["Role"]
+            if not _is_trust_policy_valid(role_name, r.get("AssumeRolePolicyDocument")):
+                iam.update_assume_role_policy(
+                    RoleName=role_name,
+                    PolicyDocument=json.dumps(trust_doc),
+                )
+                roles_mutated = True
+                remediated.append(f"Reconciled trust policy for '{role_name}'")
+                return True
+            return True
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code == "NoSuchEntity":
+                try:
+                    iam.create_role(
+                        RoleName=role_name,
+                        AssumeRolePolicyDocument=json.dumps(trust_doc),
+                        Description=f"Core IAM role {role_name} for ZT-SRE autonomous incident response",
+                    )
+                    roles_mutated = True
+                    remediated.append(f"Created missing IAM role '{role_name}' with valid trust policy")
+                    return True
+                except Exception as create_exc:
+                    print(f"  ⚠️ Warning: Failed creating {role_name}: {create_exc}")
+                    return False
+            else:
+                print(f"  ⚠️ Warning: Failed checking {role_name}: {exc}")
+                return False
+
     # 1. incidents-agent-role
     agent_role_name = "incidents-agent-role"
-    try:
-        r = iam.get_role(RoleName=agent_role_name)["Role"]
-        if not _is_trust_policy_valid(agent_role_name, r.get("AssumeRolePolicyDocument")):
-            iam.update_assume_role_policy(
+    if _ensure_role_and_trust(agent_role_name, lambda_trust):
+        try:
+            iam.attach_role_policy(
                 RoleName=agent_role_name,
-                PolicyDocument=json.dumps(lambda_trust),
+                PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
             )
-            remediated.append(f"Reconciled trust policy for '{agent_role_name}' to allow lambda.amazonaws.com")
-
-        iam.attach_role_policy(
-            RoleName=agent_role_name,
-            PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
-        )
-
-        agent_policy = {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Sid": "EventsTableAppendOnly",
-                    "Effect": "Allow",
-                    "Action": [
-                        "dynamodb:GetItem",
-                        "dynamodb:PutItem",
-                        "dynamodb:UpdateItem",
-                        "dynamodb:Query",
-                        "dynamodb:DescribeTable",
-                    ],
-                    "Resource": f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-events",
-                },
-                {
-                    "Sid": "MutableOperationalTables",
-                    "Effect": "Allow",
-                    "Action": [
-                        "dynamodb:GetItem",
-                        "dynamodb:PutItem",
-                        "dynamodb:UpdateItem",
-                        "dynamodb:DeleteItem",
-                        "dynamodb:Query",
-                        "dynamodb:DescribeTable",
-                    ],
-                    "Resource": [
-                        f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-leases",
-                        f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-dedup",
-                    ],
-                },
-                {
-                    "Effect": "Allow",
-                    "Action": ["s3:GetObject", "s3:PutObject"],
-                    "Resource": f"arn:aws:s3:::incidents-blobs-{account_id}/*",
-                },
-                {
-                    "Effect": "Allow",
-                    "Action": "secretsmanager:GetSecretValue",
-                    "Resource": f"arn:aws:secretsmanager:{reg}:{account_id}:secret:/incidents/*",
-                },
-                {
-                    "Effect": "Allow",
-                    "Action": "lambda:InvokeFunction",
-                    "Resource": [
-                        f"arn:aws:lambda:{reg}:{account_id}:function:incidents-observer",
-                        f"arn:aws:lambda:{reg}:{account_id}:function:incidents-executor",
-                        f"arn:aws:lambda:{reg}:{account_id}:function:incidents-notifier",
-                        f"arn:aws:lambda:{reg}:{account_id}:function:incidents-agent",
-                    ],
-                },
-            ],
-        }
-        iam.put_role_policy(
-            RoleName=agent_role_name,
-            PolicyName="incidents-agent-policy",
-            PolicyDocument=json.dumps(agent_policy),
-        )
-        remediated.append(f"Reconciled inline policy 'incidents-agent-policy' on '{agent_role_name}'")
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code")
-        if code != "NoSuchEntity":
-            print(f"  ⚠️ Warning: Failed reconciling {agent_role_name}: {exc}")
+            agent_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "EventsTableAppendOnly",
+                        "Effect": "Allow",
+                        "Action": [
+                            "dynamodb:GetItem",
+                            "dynamodb:PutItem",
+                            "dynamodb:UpdateItem",
+                            "dynamodb:Query",
+                            "dynamodb:DescribeTable",
+                        ],
+                        "Resource": f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-events",
+                    },
+                    {
+                        "Sid": "MutableOperationalTables",
+                        "Effect": "Allow",
+                        "Action": [
+                            "dynamodb:GetItem",
+                            "dynamodb:PutItem",
+                            "dynamodb:UpdateItem",
+                            "dynamodb:DeleteItem",
+                            "dynamodb:Query",
+                            "dynamodb:DescribeTable",
+                        ],
+                        "Resource": [
+                            f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-leases",
+                            f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-dedup",
+                        ],
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:GetObject", "s3:PutObject"],
+                        "Resource": f"arn:aws:s3:::incidents-blobs-{account_id}/*",
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": "secretsmanager:GetSecretValue",
+                        "Resource": f"arn:aws:secretsmanager:{reg}:{account_id}:secret:/incidents/*",
+                    },
+                    {
+                        "Sid": "InvokeAnyIncidentsMicroLambda",
+                        "Effect": "Allow",
+                        "Action": "lambda:InvokeFunction",
+                        "Resource": f"arn:aws:lambda:{reg}:{account_id}:function:incidents-*",
+                    },
+                ],
+            }
+            iam.put_role_policy(
+                RoleName=agent_role_name,
+                PolicyName="incidents-agent-policy",
+                PolicyDocument=json.dumps(agent_policy),
+            )
+            remediated.append(f"Reconciled inline policy 'incidents-agent-policy' on '{agent_role_name}'")
+        except Exception as exc:
+            print(f"  ⚠️ Warning: Failed configuring policies on {agent_role_name}: {exc}")
 
     # 2. incidents-observer-role
     observer_role_name = "incidents-observer-role"
-    try:
-        r = iam.get_role(RoleName=observer_role_name)["Role"]
-        if not _is_trust_policy_valid(observer_role_name, r.get("AssumeRolePolicyDocument")):
-            iam.update_assume_role_policy(
+    if _ensure_role_and_trust(observer_role_name, lambda_trust):
+        try:
+            iam.attach_role_policy(
                 RoleName=observer_role_name,
-                PolicyDocument=json.dumps(lambda_trust),
+                PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
             )
-            remediated.append(f"Reconciled trust policy for '{observer_role_name}' to allow lambda.amazonaws.com")
+            iam.attach_role_policy(
+                RoleName=observer_role_name,
+                PolicyArn="arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess",
+            )
+            observer_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": "ssm:SendCommand",
+                        "Resource": [
+                            f"arn:aws:ssm:{reg}:{account_id}:document/incidents-observe-readonly",
+                            f"arn:aws:ec2:{reg}:{account_id}:instance/*",
+                        ],
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": ["ssm:GetCommandInvocation", "ssm:ListCommands"],
+                        "Resource": "*",
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "cloudwatch:GetMetricStatistics",
+                            "cloudwatch:GetMetricData",
+                            "cloudwatch:DescribeAlarms",
+                            "logs:FilterLogEvents",
+                            "logs:DescribeLogGroups",
+                        ],
+                        "Resource": "*",
+                    },
+                    {
+                        "Sid": "EventsTableAppendOnly",
+                        "Effect": "Allow",
+                        "Action": [
+                            "dynamodb:GetItem",
+                            "dynamodb:PutItem",
+                            "dynamodb:UpdateItem",
+                            "dynamodb:Query",
+                            "dynamodb:DescribeTable",
+                        ],
+                        "Resource": f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-events",
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:GetObject", "s3:PutObject"],
+                        "Resource": f"arn:aws:s3:::incidents-blobs-{account_id}/*",
+                    },
+                ],
+            }
+            iam.put_role_policy(
+                RoleName=observer_role_name,
+                PolicyName="incidents-observer-policy",
+                PolicyDocument=json.dumps(observer_policy),
+            )
+            remediated.append(f"Reconciled inline policy 'incidents-observer-policy' on '{observer_role_name}'")
+        except Exception as exc:
+            print(f"  ⚠️ Warning: Failed configuring policies on {observer_role_name}: {exc}")
 
-        iam.attach_role_policy(
-            RoleName=observer_role_name,
-            PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
-        )
+    # 3. incidents-ingest-role
+    ingest_role_name = "incidents-ingest-role"
+    if _ensure_role_and_trust(ingest_role_name, lambda_trust):
+        try:
+            iam.attach_role_policy(
+                RoleName=ingest_role_name,
+                PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+            )
+            ingest_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "EventsTableAppendOnly",
+                        "Effect": "Allow",
+                        "Action": [
+                            "dynamodb:GetItem",
+                            "dynamodb:PutItem",
+                            "dynamodb:UpdateItem",
+                            "dynamodb:Query",
+                            "dynamodb:DescribeTable",
+                        ],
+                        "Resource": f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-events",
+                    },
+                    {
+                        "Sid": "MutableOperationalTables",
+                        "Effect": "Allow",
+                        "Action": [
+                            "dynamodb:GetItem",
+                            "dynamodb:PutItem",
+                            "dynamodb:UpdateItem",
+                            "dynamodb:DeleteItem",
+                            "dynamodb:Query",
+                            "dynamodb:DescribeTable",
+                        ],
+                        "Resource": [
+                            f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-leases",
+                            f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-dedup",
+                        ],
+                    },
+                    {
+                        "Sid": "InvokeAnyIncidentsMicroLambda",
+                        "Effect": "Allow",
+                        "Action": "lambda:InvokeFunction",
+                        "Resource": f"arn:aws:lambda:{reg}:{account_id}:function:incidents-*",
+                    },
+                ],
+            }
+            iam.put_role_policy(
+                RoleName=ingest_role_name,
+                PolicyName="incidents-ingest-policy",
+                PolicyDocument=json.dumps(ingest_policy),
+            )
+            remediated.append(f"Reconciled inline policy 'incidents-ingest-policy' on '{ingest_role_name}'")
+        except Exception as exc:
+            print(f"  ⚠️ Warning: Failed configuring policies on {ingest_role_name}: {exc}")
 
-        observer_policy = {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Action": "ssm:SendCommand",
-                    "Resource": [
-                        f"arn:aws:ssm:{reg}:{account_id}:document/incidents-observe-readonly",
-                        f"arn:aws:ec2:{reg}:{account_id}:instance/*",
-                    ],
-                },
-                {
-                    "Effect": "Allow",
-                    "Action": ["ssm:GetCommandInvocation", "ssm:ListCommands"],
-                    "Resource": "*",
-                },
-                {
-                    "Sid": "EventsTableAppendOnly",
-                    "Effect": "Allow",
-                    "Action": [
-                        "dynamodb:GetItem",
-                        "dynamodb:PutItem",
-                        "dynamodb:UpdateItem",
-                        "dynamodb:Query",
-                        "dynamodb:DescribeTable",
-                    ],
-                    "Resource": f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-events",
-                },
-                {
-                    "Effect": "Allow",
-                    "Action": ["s3:GetObject", "s3:PutObject"],
-                    "Resource": f"arn:aws:s3:::incidents-blobs-{account_id}/*",
-                },
-            ],
-        }
-        iam.put_role_policy(
-            RoleName=observer_role_name,
-            PolicyName="incidents-observer-policy",
-            PolicyDocument=json.dumps(observer_policy),
-        )
-        remediated.append(f"Reconciled inline policy 'incidents-observer-policy' on '{observer_role_name}'")
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code")
-        if code != "NoSuchEntity":
-            print(f"  ⚠️ Warning: Failed reconciling {observer_role_name}: {exc}")
+    # 4. incidents-executor-role
+    executor_role_name = "incidents-executor-role"
+    if _ensure_role_and_trust(executor_role_name, lambda_trust):
+        try:
+            iam.attach_role_policy(
+                RoleName=executor_role_name,
+                PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+            )
+            executor_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "EventsTableAppendOnly",
+                        "Effect": "Allow",
+                        "Action": [
+                            "dynamodb:GetItem",
+                            "dynamodb:PutItem",
+                            "dynamodb:UpdateItem",
+                            "dynamodb:Query",
+                            "dynamodb:DescribeTable",
+                        ],
+                        "Resource": f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-events",
+                    },
+                    {
+                        "Sid": "MutableOperationalTables",
+                        "Effect": "Allow",
+                        "Action": [
+                            "dynamodb:GetItem",
+                            "dynamodb:PutItem",
+                            "dynamodb:UpdateItem",
+                            "dynamodb:DeleteItem",
+                            "dynamodb:Query",
+                            "dynamodb:DescribeTable",
+                        ],
+                        "Resource": [
+                            f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-leases",
+                            f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-dedup",
+                        ],
+                    },
+                    {
+                        "Sid": "AssumeRemediationOperator",
+                        "Effect": "Allow",
+                        "Action": "sts:AssumeRole",
+                        "Resource": f"arn:aws:iam::{account_id}:role/RemediationOperatorRole",
+                    },
+                    {
+                        "Sid": "InvokeAnyIncidentsMicroLambda",
+                        "Effect": "Allow",
+                        "Action": "lambda:InvokeFunction",
+                        "Resource": f"arn:aws:lambda:{reg}:{account_id}:function:incidents-*",
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": "secretsmanager:GetSecretValue",
+                        "Resource": f"arn:aws:secretsmanager:{reg}:{account_id}:secret:/incidents/*",
+                    },
+                ],
+            }
+            iam.put_role_policy(
+                RoleName=executor_role_name,
+                PolicyName="incidents-executor-policy",
+                PolicyDocument=json.dumps(executor_policy),
+            )
+            remediated.append(f"Reconciled inline policy 'incidents-executor-policy' on '{executor_role_name}'")
+        except Exception as exc:
+            print(f"  ⚠️ Warning: Failed configuring policies on {executor_role_name}: {exc}")
 
-    # 3. RemediationOperatorRole
+    # 5. RemediationOperatorRole
     op_role_name = "RemediationOperatorRole"
-    try:
-        r = iam.get_role(RoleName=op_role_name)["Role"]
-        op_trust = {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Principal": {"AWS": f"arn:aws:iam::{account_id}:role/incidents-executor-role"},
-                    "Action": "sts:AssumeRole",
-                }
-            ],
-        }
-        if not _is_trust_policy_valid(op_role_name, r.get("AssumeRolePolicyDocument")):
-            iam.update_assume_role_policy(
+    if _ensure_role_and_trust(op_role_name, operator_trust):
+        try:
+            op_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "RestrictedRepairOnTaggedInstance",
+                        "Effect": "Allow",
+                        "Action": "ssm:SendCommand",
+                        "Resource": f"arn:aws:ec2:{reg}:{account_id}:instance/*",
+                        "Condition": {"StringEquals": {"ssm:resourceTag/IncidentsAgent": "true"}},
+                    },
+                    {
+                        "Sid": "AllowOnlyRestrictedRepairDocument",
+                        "Effect": "Allow",
+                        "Action": "ssm:SendCommand",
+                        "Resource": f"arn:aws:ssm:{reg}:{account_id}:document/incidents-repair-restricted",
+                    },
+                    {
+                        "Sid": "GetCommandResults",
+                        "Effect": "Allow",
+                        "Action": ["ssm:GetCommandInvocation", "ssm:ListCommands"],
+                        "Resource": "*",
+                    },
+                ],
+            }
+            iam.put_role_policy(
                 RoleName=op_role_name,
-                PolicyDocument=json.dumps(op_trust),
+                PolicyName="RemediationOperatorRolePolicy",
+                PolicyDocument=json.dumps(op_policy),
             )
-            remediated.append(f"Reconciled trust policy for '{op_role_name}' to allow incidents-executor-role")
+            remediated.append(f"Reconciled inline policy 'RemediationOperatorRolePolicy' on '{op_role_name}'")
+        except Exception as exc:
+            print(f"  ⚠️ Warning: Failed configuring policies on {op_role_name}: {exc}")
 
-        op_policy = {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Sid": "RestrictedRepairOnTaggedInstance",
-                    "Effect": "Allow",
-                    "Action": "ssm:SendCommand",
-                    "Resource": f"arn:aws:ec2:{reg}:{account_id}:instance/*",
-                    "Condition": {"StringEquals": {"ssm:resourceTag/IncidentsAgent": "true"}},
-                },
-                {
-                    "Sid": "AllowOnlyRestrictedRepairDocument",
-                    "Effect": "Allow",
-                    "Action": "ssm:SendCommand",
-                    "Resource": f"arn:aws:ssm:{reg}:{account_id}:document/incidents-repair-restricted",
-                },
-                {
-                    "Sid": "GetCommandResults",
-                    "Effect": "Allow",
-                    "Action": ["ssm:GetCommandInvocation", "ssm:ListCommands"],
-                    "Resource": "*",
-                },
-            ],
-        }
-        iam.put_role_policy(
-            RoleName=op_role_name,
-            PolicyName="RemediationOperatorRolePolicy",
-            PolicyDocument=json.dumps(op_policy),
-        )
-        remediated.append(f"Reconciled inline policy 'RemediationOperatorRolePolicy' on '{op_role_name}'")
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code")
-        if code != "NoSuchEntity":
-            print(f"  ⚠️ Warning: Failed reconciling {op_role_name}: {exc}")
+    # 6. Propagation Delay for AWS STS eventual consistency
+    if roles_mutated:
+        effective_delay = 0 if os.environ.get("PYTEST_CURRENT_TEST") else propagation_delay
+        if effective_delay > 0:
+            print(f"  ⏳ Waiting {effective_delay}s for IAM trust policies to propagate across regional STS...")
+            time.sleep(effective_delay)
 
     return remediated
 

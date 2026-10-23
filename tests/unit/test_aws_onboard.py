@@ -1681,6 +1681,50 @@ class TestCoreIamRolesReconciliation:
         params, pre_actions, _ = build_cfn_parameters(report)
         assert any("Reconcile IAM Role Trust Policy (incidents-agent-role)" in a for a in pre_actions)
 
+    def test_ensure_core_iam_roles_creates_missing_roles_when_not_exist(self):
+        mock_session = MagicMock()
+        mock_iam = MagicMock()
+        mock_session.client.return_value = mock_iam
+        mock_session.region_name = "us-east-1"
+
+        # Simulate NoSuchEntity on get_role
+        from botocore.exceptions import ClientError
+        mock_iam.get_role.side_effect = ClientError({"Error": {"Code": "NoSuchEntity", "Message": "Role does not exist"}}, "GetRole")
+
+        remediated = ensure_core_iam_roles(mock_session, account_id="111122223333", region="us-east-1", propagation_delay=0)
+
+        # 5 roles created
+        assert mock_iam.create_role.call_count == 5
+        created_role_names = [c[1]["RoleName"] for c in mock_iam.create_role.call_args_list]
+        assert "incidents-agent-role" in created_role_names
+        assert "incidents-observer-role" in created_role_names
+        assert "incidents-ingest-role" in created_role_names
+        assert "incidents-executor-role" in created_role_names
+        assert "RemediationOperatorRole" in created_role_names
+
+        # Verify lambda.amazonaws.com trust on agent role
+        agent_create = [c for c in mock_iam.create_role.call_args_list if c[1]["RoleName"] == "incidents-agent-role"][0]
+        trust = json.loads(agent_create[1]["AssumeRolePolicyDocument"])
+        assert trust["Statement"][0]["Principal"]["Service"] == "lambda.amazonaws.com"
+
+        # Verify AmazonSSMReadOnlyAccess attached to incidents-observer-role
+        mock_iam.attach_role_policy.assert_any_call(
+            RoleName="incidents-observer-role",
+            PolicyArn="arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess",
+        )
+
+        # Verify wildcard lambda:InvokeFunction in incidents-agent-role inline policy
+        agent_put = [c for c in mock_iam.put_role_policy.call_args_list if c[1]["RoleName"] == "incidents-agent-role"][0]
+        agent_pol = json.loads(agent_put[1]["PolicyDocument"])
+        invoke_stmt = [s for s in agent_pol["Statement"] if s.get("Action") == "lambda:InvokeFunction"][0]
+        assert invoke_stmt["Resource"] == "arn:aws:lambda:us-east-1:111122223333:function:incidents-*"
+
+        # Verify wildcard lambda:InvokeFunction in incidents-ingest-role inline policy
+        ingest_put = [c for c in mock_iam.put_role_policy.call_args_list if c[1]["RoleName"] == "incidents-ingest-role"][0]
+        ingest_pol = json.loads(ingest_put[1]["PolicyDocument"])
+        ingest_invoke = [s for s in ingest_pol["Statement"] if s.get("Action") == "lambda:InvokeFunction"][0]
+        assert ingest_invoke["Resource"] == "arn:aws:lambda:us-east-1:111122223333:function:incidents-*"
+
 
 class TestEnvFileInjection:
     """
