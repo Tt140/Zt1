@@ -903,6 +903,7 @@ def build_cfn_parameters(
     stack_name: str = "autonomous-secops-agent",
     create_target_vps: bool = False,
     existing_bucket: Optional[str] = None,
+    is_apply: bool = False,
 ) -> Tuple[Dict[str, str], List[str], str]:
     """
     Computes exact parameter overrides for template.yaml based on audit discovery,
@@ -998,7 +999,7 @@ def build_cfn_parameters(
     # 8. Alarms
     if report.ec2.target_valid or create_target_vps:
         params["EnableAlarms"] = "true"
-        params["EnableDiskAlarm"] = "true" if (report.ec2.has_cwagent_disk_metrics or create_target_vps) else "false"
+        params["EnableDiskAlarm"] = "true" if (report.ec2.has_cwagent_disk_metrics or create_target_vps or is_apply) else "false"
     else:
         params["EnableAlarms"] = "false"
         params["EnableDiskAlarm"] = "false"
@@ -1350,20 +1351,27 @@ else
 fi
 [ -z "$REGION" ] && REGION="us-east-1"
 
-# 1. Package manager detection & CWAgent install if missing
+# 1. Package manager detection & CWAgent install (do not install curl to prevent curl-minimal conflict on AL2023)
 if [ ! -f /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]; then
-    if command -v dnf >/dev/null 2>&1 && dnf list amazon-cloudwatch-agent >/dev/null 2>&1; then
-        dnf install -y amazon-cloudwatch-agent curl
-    elif command -v yum >/dev/null 2>&1 && yum list amazon-cloudwatch-agent >/dev/null 2>&1; then
-        yum install -y amazon-cloudwatch-agent curl
+    if command -v dnf >/dev/null 2>&1; then
+        dnf install -y amazon-cloudwatch-agent || true
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y amazon-cloudwatch-agent || true
     elif command -v apt-get >/dev/null 2>&1; then
-        curl -sSL "https://amazoncloudwatch-agent-${REGION}.s3.${REGION}.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb" -o /tmp/cwagent.deb 2>/dev/null || curl -sSL "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb" -o /tmp/cwagent.deb
-        dpkg -i -E /tmp/cwagent.deb || true
-        rm -f /tmp/cwagent.deb
-    else
+        apt-get update -y && apt-get install -y amazon-cloudwatch-agent || true
+    fi
+fi
+
+# Fallback to direct official AWS RPM/DEB if not installed via repo
+if [ ! -f /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]; then
+    if command -v rpm >/dev/null 2>&1; then
         curl -sSL "https://amazoncloudwatch-agent-${REGION}.s3.${REGION}.amazonaws.com/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm" -o /tmp/cwagent.rpm 2>/dev/null || curl -sSL "https://amazoncloudwatch-agent.s3.amazonaws.com/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm" -o /tmp/cwagent.rpm
         rpm -Uvh --replacepkgs /tmp/cwagent.rpm || true
         rm -f /tmp/cwagent.rpm
+    elif command -v dpkg >/dev/null 2>&1; then
+        curl -sSL "https://amazoncloudwatch-agent-${REGION}.s3.${REGION}.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb" -o /tmp/cwagent.deb 2>/dev/null || curl -sSL "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb" -o /tmp/cwagent.deb
+        dpkg -i -E /tmp/cwagent.deb || true
+        rm -f /tmp/cwagent.deb
     fi
 fi
 
@@ -1573,11 +1581,11 @@ set -e
 
 # 1. Package manager detection and universal package installation
 if command -v dnf >/dev/null 2>&1; then
-    dnf install -y nginx amazon-cloudwatch-agent curl
+    dnf install -y nginx amazon-cloudwatch-agent || true
 elif command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y && apt-get install -y nginx amazon-cloudwatch-agent curl
+    apt-get update -y && apt-get install -y nginx amazon-cloudwatch-agent || true
 elif command -v yum >/dev/null 2>&1; then
-    yum install -y nginx amazon-cloudwatch-agent curl
+    yum install -y nginx amazon-cloudwatch-agent || true
 fi
 
 systemctl enable --now nginx || true
@@ -1930,6 +1938,7 @@ def run_apply_mode(
         strands_override=args.strands_url.strip() or None,
         stack_name=args.stack_name,
         create_target_vps=create_vps and not target_id,
+        is_apply=True,
     )
     print_plan(report, params, pre_actions, sam_command)
 
@@ -2014,6 +2023,7 @@ def run_apply_mode(
         strands_override=args.strands_url.strip() or None,
         stack_name=args.stack_name,
         existing_bucket=getattr(args, "existing_bucket", "").strip() or None,
+        is_apply=True,
     )
 
     # 4. SAM deployment
