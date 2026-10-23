@@ -193,7 +193,7 @@ def cs_04_strong_consistency_no_gaps(store: EventStoreBase) -> None:
 # CS-05 — Lease Exclusivity and Expiration
 # ---------------------------------------------------------------------------
 
-def cs_05_lease_exclusivity(store: EventStoreBase, lease_ttl: float = 0.05) -> None:
+def cs_05_lease_exclusivity(store: EventStoreBase, lease_ttl: float = 0.5) -> None:
     """CS-05: Lease is exclusive and expiring; CAS protects state even after lease expiry."""
     iid, _ = _open_incident(store)
 

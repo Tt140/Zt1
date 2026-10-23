@@ -790,7 +790,7 @@ Resources:
 
   SystemDegradedAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: ShouldCreateDiskAlarm
+    Condition: ShouldCreateAlarms
     Properties:
       AlarmName: !Sub "System-Degraded-${TargetInstanceId}"
       AlarmDescription: "Triggers autonomous agent investigation when any systemd service fails or crashes"

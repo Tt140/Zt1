@@ -1456,5 +1456,59 @@ class TestAwsOnboardPlanner:
         assert "⚠️ PLACEHOLDER ONLY in Secrets Manager ('/incidents/deepseek-api-key') — Client must update with a valid API key before live inference" in out
         assert "✅ Present & Active" not in out
 
+    def test_ensure_instance_telemetry_bootstraps_cwagent_and_systemd_pulse(self):
+        """
+        Verifies that ensure_instance_telemetry:
+        1. Checks EC2 running state and SSM ping status.
+        2. Dispatches universal multi-distro script via ssm.send_command(AWS-RunShellScript).
+        3. Returns True when command succeeds.
+        """
+        from scripts.aws_onboard import ensure_instance_telemetry
+
+        mock_session = MagicMock()
+        mock_ssm = MagicMock()
+        mock_ec2 = MagicMock()
+
+        def mock_client(svc, region_name=None):
+            if svc == "ssm":
+                return mock_ssm
+            if svc == "ec2":
+                return mock_ec2
+            return MagicMock()
+
+        mock_session.client.side_effect = mock_client
+        mock_session.region_name = "us-east-1"
+
+        mock_ec2.describe_instances.return_value = {
+            "Reservations": [{
+                "Instances": [{
+                    "InstanceId": "i-brownfield-client",
+                    "State": {"Name": "running"},
+                }]
+            }]
+        }
+        mock_ssm.describe_instance_information.return_value = {
+            "InstanceInformationList": [{"PingStatus": "Online"}]
+        }
+        mock_ssm.send_command.return_value = {
+            "Command": {"CommandId": "cmd-test-12345"}
+        }
+        mock_ssm.get_command_invocation.return_value = {
+            "Status": "Success",
+            "StandardOutputContent": "TELEMETRY_BOOTSTRAP_COMPLETE",
+        }
+
+        success = ensure_instance_telemetry(mock_session, instance_id="i-brownfield-client", dry_run=False, timeout_seconds=5)
+        assert success is True
+        mock_ssm.send_command.assert_called_once()
+        call_kwargs = mock_ssm.send_command.call_args[1]
+        assert call_kwargs["DocumentName"] == "AWS-RunShellScript"
+        assert call_kwargs["InstanceIds"] == ["i-brownfield-client"]
+        script_sent = call_kwargs["Parameters"]["commands"][0]
+        assert "amazon-cloudwatch-agent" in script_sent
+        assert "cwsys_health.timer" in script_sent
+        assert "FailedServicesCount" in script_sent
+
+
 
 

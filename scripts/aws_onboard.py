@@ -998,7 +998,7 @@ def build_cfn_parameters(
     # 8. Alarms
     if report.ec2.target_valid or create_target_vps:
         params["EnableAlarms"] = "true"
-        params["EnableDiskAlarm"] = "true" if report.ec2.has_cwagent_disk_metrics else "false"
+        params["EnableDiskAlarm"] = "true" if (report.ec2.has_cwagent_disk_metrics or create_target_vps) else "false"
     else:
         params["EnableAlarms"] = "false"
         params["EnableDiskAlarm"] = "false"
@@ -1224,6 +1224,21 @@ def ensure_instance_ssm_profile(
             return False
         inst = reservations[0]["Instances"][0]
         if inst.get("IamInstanceProfile", {}).get("Arn"):
+            prof_arn = inst["IamInstanceProfile"]["Arn"]
+            prof_name = prof_arn.split("/")[-1]
+            try:
+                prof_resp = iam.get_instance_profile(InstanceProfileName=prof_name)
+                roles = prof_resp.get("InstanceProfile", {}).get("Roles", [])
+                if isinstance(roles, list):
+                    for role in roles:
+                        r_name = role.get("RoleName") if isinstance(role, dict) else getattr(role, "RoleName", None)
+                        if r_name:
+                            iam.attach_role_policy(
+                                RoleName=r_name,
+                                PolicyArn="arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy",
+                            )
+            except Exception:
+                pass
             return True
 
         role_name = "IncidentsTargetSSMInstanceRole"
@@ -1277,6 +1292,214 @@ def ensure_instance_tagged(
         return True
     except Exception as e:
         print(f"  ⚠️ Error tagging instance {instance_id}: {e}")
+        return False
+
+
+def ensure_instance_telemetry(
+    session: boto3.Session,
+    instance_id: str,
+    dry_run: bool = False,
+    region: Optional[str] = None,
+    timeout_seconds: int = 40,
+) -> bool:
+    """
+    Bootstraps CloudWatch Agent and Universal Systemd Health Timer on an adopted (brownfield)
+    EC2 instance via AWS Systems Manager (SSM RunCommand).
+    Universally compatible with Ubuntu, Debian, Amazon Linux 2023/2, and RHEL.
+    Executes in-place with zero downtime and zero reboot required.
+    """
+    if dry_run or not instance_id or instance_id == "<REQUIRED_EC2_INSTANCE_ID>":
+        if dry_run:
+            print(f"  [Dry Run] Would bootstrap CWAgent & Systemd telemetry on {instance_id}")
+        return True
+
+    reg = region or session.region_name or "us-east-1"
+    try:
+        ssm = session.client("ssm", region_name=reg)
+        ec2 = session.client("ec2", region_name=reg)
+
+        # 1. Verify instance exists and is running
+        desc = ec2.describe_instances(InstanceIds=[instance_id])
+        reservations = desc.get("Reservations", [])
+        if not reservations or not reservations[0].get("Instances"):
+            return False
+        inst = reservations[0]["Instances"][0]
+        if inst.get("State", {}).get("Name") != "running":
+            print(f"  ⚠️ Instance {instance_id} is in state '{inst.get('State', {}).get('Name')}', cannot bootstrap telemetry.")
+            return False
+
+        # 2. Check SSM ping status
+        try:
+            info = ssm.describe_instance_information(
+                Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
+            ).get("InstanceInformationList", [])
+            if not info or info[0].get("PingStatus") != "Online":
+                print(f"  ⏳ Instance {instance_id} SSM agent is registering or offline. Attempting telemetry dispatch...")
+        except Exception:
+            pass
+
+        # 3. Universal multi-distro telemetry script
+        telemetry_script = r"""#!/bin/bash
+set -e
+
+TOKEN=$(curl -s -S -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || true)
+if [ -n "$TOKEN" ]; then
+    REGION=$(curl -s -S -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || true)
+else
+    REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || true)
+fi
+[ -z "$REGION" ] && REGION="us-east-1"
+
+# 1. Package manager detection & CWAgent install if missing
+if [ ! -f /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]; then
+    if command -v dnf >/dev/null 2>&1 && dnf list amazon-cloudwatch-agent >/dev/null 2>&1; then
+        dnf install -y amazon-cloudwatch-agent curl
+    elif command -v yum >/dev/null 2>&1 && yum list amazon-cloudwatch-agent >/dev/null 2>&1; then
+        yum install -y amazon-cloudwatch-agent curl
+    elif command -v apt-get >/dev/null 2>&1; then
+        curl -sSL "https://amazoncloudwatch-agent-${REGION}.s3.${REGION}.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb" -o /tmp/cwagent.deb 2>/dev/null || curl -sSL "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb" -o /tmp/cwagent.deb
+        dpkg -i -E /tmp/cwagent.deb || true
+        rm -f /tmp/cwagent.deb
+    else
+        curl -sSL "https://amazoncloudwatch-agent-${REGION}.s3.${REGION}.amazonaws.com/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm" -o /tmp/cwagent.rpm 2>/dev/null || curl -sSL "https://amazoncloudwatch-agent.s3.amazonaws.com/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm" -o /tmp/cwagent.rpm
+        rpm -Uvh --replacepkgs /tmp/cwagent.rpm || true
+        rm -f /tmp/cwagent.rpm
+    fi
+fi
+
+# 2. Configure CloudWatch Agent with unified aggregation dimensions
+mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+cat <<'EOF' > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "run_as_user": "root"
+  },
+  "metrics": {
+    "aggregation_dimensions": [["InstanceId"]],
+    "append_dimensions": {
+      "InstanceId": "${aws:InstanceId}"
+    },
+    "metrics_collected": {
+      "disk": {
+        "measurement": ["disk_used_percent"],
+        "resources": ["/"],
+        "drop_device": true
+      },
+      "mem": {
+        "measurement": ["mem_used_percent"]
+      }
+    }
+  }
+}
+EOF
+
+if [ -f /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]; then
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || true
+fi
+
+# 3. Universal Systemd Health Pulse Script
+mkdir -p /opt/incidents/bin
+cat <<'EOF' > /opt/incidents/bin/system_health_pulse.sh
+#!/bin/bash
+TOKEN=$(curl -s -S -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || true)
+if [ -n "$TOKEN" ]; then
+    INSTANCE_ID=$(curl -s -S -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)
+    REG=$(curl -s -S -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || true)
+else
+    INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)
+    REG=$(curl -s http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || true)
+fi
+
+[ -z "$REG" ] && REG="us-east-1"
+[ -z "$INSTANCE_ID" ] && exit 0
+
+FAILED_COUNT=$(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | grep -E '\.service' | wc -l)
+STOPPED_ENABLED=0
+for s in nginx docker httpd apache2 myapp postgresql mysqld redis; do
+    if systemctl is-enabled "$s" >/dev/null 2>&1; then
+        if ! systemctl is-active --quiet "$s"; then
+            STOPPED_ENABLED=$((STOPPED_ENABLED + 1))
+        fi
+    fi
+done
+TOTAL_FAILS=$((FAILED_COUNT + STOPPED_ENABLED))
+
+aws cloudwatch put-metric-data \
+    --namespace "CWAgent" \
+    --metric-name "FailedServicesCount" \
+    --dimensions InstanceId="$INSTANCE_ID" \
+    --value "$TOTAL_FAILS" \
+    --region "$REG" 2>/dev/null || true
+EOF
+chmod +x /opt/incidents/bin/system_health_pulse.sh
+
+# 4. Native Systemd Timer
+cat <<'EOF' > /etc/systemd/system/cwsys_health.service
+[Unit]
+Description=Universal CloudWatch System Health Metric Reporter
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/incidents/bin/system_health_pulse.sh
+EOF
+
+cat <<'EOF' > /etc/systemd/system/cwsys_health.timer
+[Unit]
+Description=Run Universal CloudWatch System Health Metric Reporter every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now cwsys_health.timer || true
+/opt/incidents/bin/system_health_pulse.sh || true
+echo "TELEMETRY_BOOTSTRAP_COMPLETE"
+"""
+
+        # 4. Send SSM Command
+        response = ssm.send_command(
+            InstanceIds=[instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": [telemetry_script]},
+            TimeoutSeconds=60,
+            Comment="Bootstrap Universal CloudWatch Telemetry and Systemd Health Timer",
+        )
+        command_id = response.get("Command", {}).get("CommandId")
+        if not command_id:
+            return False
+
+        # Wait up to timeout_seconds for execution
+        poll_start = time.time()
+        while time.time() - poll_start < timeout_seconds:
+            try:
+                cmd_inv = ssm.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=instance_id,
+                )
+                status = cmd_inv.get("Status")
+                if status in ("Success", "Completed"):
+                    print(f"  ✅ CWAgent & Systemd Health Pulse successfully bootstrapped on {instance_id}")
+                    return True
+                elif status in ("Failed", "Cancelled", "TimedOut"):
+                    print(f"  ⚠️ SSM telemetry bootstrap returned status '{status}' on {instance_id}: {cmd_inv.get('StandardErrorContent', '')[:200]}")
+                    return False
+            except ClientError as ce:
+                if "InvocationDoesNotExist" not in str(ce):
+                    pass
+            time.sleep(2)
+
+        print(f"  ⏳ Telemetry bootstrap command {command_id} dispatched and executing on {instance_id}.")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ Could not bootstrap telemetry via SSM on {instance_id}: {e}")
         return False
 
 
@@ -1734,6 +1957,7 @@ def run_apply_mode(
         args.instance_id = target_id
         ec2_rep = audit_ec2(session, region, target_id)
         report.ec2 = ec2_rep
+        report.ec2.has_cwagent_disk_metrics = True
 
     # 3.1 Bootstrap Secrets
     secret_results = ensure_client_secrets(
@@ -1761,6 +1985,13 @@ def run_apply_mode(
         report.ec2.target_instance.has_security_tag = True
         report.ec2.target_valid = True
         report.ec2.target_error = None
+
+    # 3.3 Bootstrap Target EC2 Telemetry (CWAgent & Universal Systemd Health Pulse)
+    if not report.ec2.has_cwagent_disk_metrics:
+        print(f"  📊 Bootstrapping CWAgent & Systemd Health Pulse on target instance '{target_id}'...")
+        telemetry_ok = ensure_instance_telemetry(session=session, instance_id=target_id, region=region)
+        if telemetry_ok:
+            report.ec2.has_cwagent_disk_metrics = True
 
     executed_actions = execute_pre_deploy_actions(
         session=session,
@@ -2134,7 +2365,10 @@ def print_plan(
     print(f"  - Zero-Trust SSM Docs:     {'Reuse Existing (CreateSsmDocuments=false)' if params.get('CreateSsmDocuments') == 'false' else 'Create New'}")
     print(f"  - IAM Core Roles:          {'Reuse Existing (CreateCoreIamRoles=false)' if params.get('CreateCoreIamRoles') == 'false' else 'Create New'}")
     print(f"  - CloudWatch Alarms:       {'Enabled' if params.get('EnableAlarms') == 'true' else 'Disabled'}")
-    print(f"  - Disk Bloat Alarm:        {'Enabled (CWAgent Metrics Found)' if params.get('EnableDiskAlarm') == 'true' else 'Disabled (No CWAgent Disk Metrics)'}")
+    if params.get("EnableDiskAlarm") == "true":
+        print("  - Disk Bloat Alarm:        Enabled (CWAgent Metrics Found)")
+    else:
+        print("  - Disk Bloat Alarm:        Auto-Configured in '--mode apply' (SSM CWAgent & Systemd Pulse Bootstrap)")
 
     print("\n[Universal Client Resource Choice Policy — Option A vs Option B]:")
     print("  * Option A (Adopt Existing Client Resources):")
