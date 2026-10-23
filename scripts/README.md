@@ -81,6 +81,7 @@ To prevent unintended modifications to existing production workloads, `aws_onboa
 ### Option A: Adopt Existing Client Resources (Non-Intrusive Brownfield)
 Designed for enterprise clients integrating the agent into an existing environment without deploying new servers or storage:
 * **Target EC2 Instance**: Pass `--instance-id <INSTANCE_ID>`. The CLI inspects the server, verifies SSM connectivity, and attaches the `IncidentsAgent=true` tag.
+* **Brownfield Telemetry Auto-Bootstrap**: In `--mode apply`, the CLI uses AWS Systems Manager (`AWS-RunShellScript`) to automatically bootstrap `amazon-cloudwatch-agent` and the native systemd health timer (`cwsys_health.timer`) on the existing server in-place with **Zero Downtime and Zero Reboot**. It automatically attaches `CloudWatchAgentServerPolicy` to any existing IAM profile and enables all 5 production alarms (`High-CPU`, `StatusCheckFailed`, `High-Disk`, `High-Memory`, and decoupled `System-Degraded`).
 * **Storage Bucket**: Pass `--existing-bucket <BUCKET_NAME>`. The tool sets SAM parameter `CreateBlobsBucket=false` and configures the agent to use the client's existing bucket for large incident telemetry blobs.
 * **LLM Secrets**: Pass `--deepseek-api-key <KEY>` to securely store credentials into the client's AWS Secrets Manager (`/incidents/deepseek-api-key`).
 
