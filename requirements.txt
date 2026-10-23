@@ -1,6 +1,8 @@
 # Runtime dependencies only — bundled into AWS Lambda deployment package
 # DO NOT add testing or development dependencies here.
 
+#IAC
+aws-sam-cli
 # AWS SDK
 boto3>=1.34.0
 botocore>=1.34.0
