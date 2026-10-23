@@ -1725,6 +1725,73 @@ class TestCoreIamRolesReconciliation:
         ingest_invoke = [s for s in ingest_pol["Statement"] if s.get("Action") == "lambda:InvokeFunction"][0]
         assert ingest_invoke["Resource"] == "arn:aws:lambda:us-east-1:111122223333:function:incidents-*"
 
+    def test_ensure_core_iam_roles_propagation_delay(self, monkeypatch):
+        mock_session = MagicMock()
+        mock_iam = MagicMock()
+        mock_session.client.return_value = mock_iam
+        mock_session.region_name = "us-east-1"
+
+        from botocore.exceptions import ClientError
+        mock_iam.get_role.side_effect = ClientError({"Error": {"Code": "NoSuchEntity", "Message": "Missing"}}, "GetRole")
+
+        # Temporarily remove PYTEST_CURRENT_TEST so propagation delay logic executes
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+        with patch("time.sleep") as mock_sleep:
+            remediated = ensure_core_iam_roles(mock_session, account_id="111122223333", region="us-east-1", propagation_delay=12)
+            mock_sleep.assert_called_once_with(12)
+            assert len(remediated) > 0
+
+    def test_ensure_core_iam_roles_all_roles_wildcard_invoke(self):
+        mock_session = MagicMock()
+        mock_iam = MagicMock()
+        mock_session.client.return_value = mock_iam
+        mock_session.region_name = "us-east-1"
+
+        from botocore.exceptions import ClientError
+        mock_iam.get_role.side_effect = ClientError({"Error": {"Code": "NoSuchEntity", "Message": "Missing"}}, "GetRole")
+
+        ensure_core_iam_roles(mock_session, account_id="999988887777", region="us-east-1", propagation_delay=0)
+
+        put_calls = {c[1]["RoleName"]: json.loads(c[1]["PolicyDocument"]) for c in mock_iam.put_role_policy.call_args_list}
+
+        # Check agent role
+        agent_stmts = put_calls["incidents-agent-role"]["Statement"]
+        agent_invoke = next(s for s in agent_stmts if s.get("Action") == "lambda:InvokeFunction")
+        assert agent_invoke["Resource"] == "arn:aws:lambda:us-east-1:999988887777:function:incidents-*"
+
+        # Check ingest role
+        ingest_stmts = put_calls["incidents-ingest-role"]["Statement"]
+        ingest_invoke = next(s for s in ingest_stmts if s.get("Action") == "lambda:InvokeFunction")
+        assert ingest_invoke["Resource"] == "arn:aws:lambda:us-east-1:999988887777:function:incidents-*"
+
+        # Check executor role
+        executor_stmts = put_calls["incidents-executor-role"]["Statement"]
+        executor_invoke = next(s for s in executor_stmts if s.get("Action") == "lambda:InvokeFunction")
+        assert executor_invoke["Resource"] == "arn:aws:lambda:us-east-1:999988887777:function:incidents-*"
+
+    def test_ensure_core_iam_roles_observer_ssm_readonly_policy(self):
+        mock_session = MagicMock()
+        mock_iam = MagicMock()
+        mock_session.client.return_value = mock_iam
+        mock_session.region_name = "us-east-1"
+
+        from botocore.exceptions import ClientError
+        mock_iam.get_role.side_effect = ClientError({"Error": {"Code": "NoSuchEntity", "Message": "Missing"}}, "GetRole")
+
+        ensure_core_iam_roles(mock_session, account_id="999988887777", region="us-east-1", propagation_delay=0)
+
+        # Verify managed policy attachments
+        attached = [(c[1]["RoleName"], c[1]["PolicyArn"]) for c in mock_iam.attach_role_policy.call_args_list]
+        assert ("incidents-observer-role", "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole") in attached
+        assert ("incidents-observer-role", "arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess") in attached
+
+        # Verify inline policy contains ssm:SendCommand on incidents-observe-readonly
+        put_calls = {c[1]["RoleName"]: json.loads(c[1]["PolicyDocument"]) for c in mock_iam.put_role_policy.call_args_list}
+        observer_stmts = put_calls["incidents-observer-role"]["Statement"]
+        ssm_cmd_stmt = next(s for s in observer_stmts if s.get("Action") == "ssm:SendCommand")
+        assert "arn:aws:ssm:us-east-1:999988887777:document/incidents-observe-readonly" in ssm_cmd_stmt["Resource"]
+
 
 class TestEnvFileInjection:
     """

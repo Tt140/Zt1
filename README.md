@@ -212,6 +212,7 @@ This platform was engineered from first principles to be **100% non-intrusive, w
 | **Disk Device Fragmentation** | Alarms break across instance types (`nvme0n1p1` vs `xvda1`) | **Unified Aggregation Dimensions** (`aggregation_dimensions: [["InstanceId"]]`) |
 | **Alarm Decoupling** | Service degradation suppressed if disk metrics absent | **Fully Decoupled `SystemDegradedAlarm`** evaluating 100% independently |
 | **Regional SCP & IAM Constraints** | Cross-region IAM roles triggering SCP `AccessDenied` | **SCP-Immune BYOK Architecture** with zero cross-region dependencies |
+| **Core IAM Role Gaps & Drift** | Missing roles cause Lambda `AccessDenied` assume errors | **Self-Healing Core IAM Engine** (Auto-creates missing roles, wildcard `incidents-*` invocation, 12s STS propagation delay) |
 
 ---
 
@@ -224,6 +225,7 @@ python3 scripts/aws_onboard.py --mode apply --instance-id <INSTANCE_ID> -E .env 
 ```
 * **Strict Security Segregation**: Sensitive credentials (`DEEPSEEK_API_KEY`, `APPROVAL_MAC_KEY_HEX`, Slack tokens) are routed directly and securely into **AWS Secrets Manager** via HTTPS API.
 * **Operational Configuration**: Model identifiers and routing parameters (`DEEPSEEK_FLASH_MODEL`, `DEEPSEEK_BASE_URL`, `STRANDS_URL`, etc.) are passed as SAM parameter overrides to update the Lambda environment.
+* **Self-Healing IAM Layer**: Automatically reconciles all 5 core execution roles with wildcard inter-Lambda permissions and guarantees STS consistency before deployment.
 * **Git Safe**: `template.yaml` remains 100% free of secrets, and `.env` is strictly protected inside `.gitignore`.
 
 ---
@@ -237,7 +239,7 @@ sam deploy --guided
 
 ---
 
-### 3. Running the Automated Test Suite (554 Tests - 100% Pass Rate)
+### 3. Running the Automated Test Suite (556 Tests - 100% Pass Rate)
 Install dependencies and run the complete test suite:
 ```bash
 pip install -r requirements-dev.txt

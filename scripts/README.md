@@ -178,9 +178,24 @@ python3 scripts/aws_onboard.py --mode apply --instance-id <INSTANCE_ID> -E .env 
 | `SLACK_CHANNEL` | `CloudFormation / SAM Parameter` (`SlackChannel`) | Target Slack channel for security alerts. |
 
 #### Security & Git Hygiene Invariants:
-1. **Zero Git Leaks**: `template.yaml` remains 100% decoupled from private credentials. `.env` files remain strictly ignored by `.gitignore`.
+1. **Zero Git Leaks**: `template.yaml` remains 100% free from private credentials. `.env` files remain strictly ignored by `.gitignore`.
 2. **Zero Plaintext Logs**: Secrets are sent directly to AWS Secrets Manager using boto3 HTTPS API calls; they are never appended to `sam deploy --parameter-overrides` commands or echoed in terminal logs.
 3. **Automatic Placeholder Overwrite**: If `/incidents/deepseek-api-key` was previously initialized as a `PLACEHOLDER`, passing `-E` automatically overwrites it with the valid active credential.
+
+### 9. Self-Healing Core IAM Roles Engine & STS Eventual Consistency Delay
+
+When adopting brownfield environments where IAM roles may have been partially deleted, misconfigured, or left without appropriate service trust relationships, `aws_onboard.py` includes a **Self-Healing Core IAM Roles Engine** (`ensure_core_iam_roles`):
+
+1. **Idempotent 5-Role Lifecycle**: Automatically inspects, creates (`iam.create_role` on `NoSuchEntity`), and reconciles all core execution roles:
+   - `incidents-agent-role` (Lambda reasoning loop & orchestration)
+   - `incidents-observer-role` (SSM read-only observation & CloudWatch telemetry)
+   - `incidents-ingest-role` (CloudWatch Alarm event ingestion & agent triggering)
+   - `incidents-executor-role` (Policy Gate enforcement & STS AssumeRole for remediation)
+   - `RemediationOperatorRole` (Zero-Trust surgical repair on tagged instances)
+2. **Wildcard Inter-Lambda Invocation Policy**: Grants `lambda:InvokeFunction` on `arn:aws:lambda:${reg}:${account_id}:function:incidents-*` across all execution roles, eliminating `AccessDeniedException` across internal micro-Lambdas (`incidents-observer`, `incidents-executor`, `incidents-notifier`).
+3. **Complete Observer Permissions**: Attaches both `AWSLambdaBasicExecutionRole` and `AmazonSSMReadOnlyAccess` to `incidents-observer-role`, alongside inline permissions for `incidents-observe-readonly`.
+4. **AWS STS Regional Propagation Delay**: Regional STS endpoints in `us-east-1` exhibit eventual consistency. Whenever a role is newly created or a trust policy is updated (`roles_mutated = True`), `aws_onboard.py` automatically pauses for a safe 12-second propagation window before starting SAM build/deploy, preventing `The role defined for the function cannot be assumed by Lambda` errors.
+5. **Resilient Secrets Resolution (Silenced 404s)**: Runtime secret resolution in `handlers/shared.py` catches `ResourceNotFoundException` at `DEBUG` level and returns empty strings cleanly for unconfigured optional secrets (such as Slack webhooks), preventing false alarms in CloudWatch logs.
 
 ---
 
