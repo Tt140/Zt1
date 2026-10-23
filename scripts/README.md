@@ -120,10 +120,15 @@ When `sam deploy` fails, standard tooling frequently outputs generic errors like
 ### 4. Strict `.env` Isolation & Placeholder Detection
 The CLI inspects environment configurations and AWS Secrets Manager for unpopulated placeholder values (e.g. `YOUR_KEY_HERE`, `placeholder`). It flags unconfigured Slack webhooks or LLM tokens transparently and outputs a sanitized `.env.onboarded` file with zero secrets leaked.
 
-### 5. Universal Native Systemd Health Pulse (Crash & Clean Stop Dual Detection)
+### 5. Universal Native Systemd Health Pulse (Crash & Dynamic Clean Stop Detection)
 Traditional monitoring scripts either fail on distributions lacking `cronie` (such as Amazon Linux 2023) or only detect abnormal crashes via `systemctl --failed` while ignoring manual or administrative service stops (`systemctl stop`).
-* **Remediation**: `aws_onboard.py` deploys a native Linux Systemd Timer (`cwsys_health.timer`) running every 60 seconds with IMDSv2 token security. It calculates:
-  $$\text{Failed Services} = \text{failed units count} + \text{enabled but inactive critical daemons count}$$
+* **Remediation**: `aws_onboard.py` automatically injects and activates a native Linux Systemd Timer (`cwsys_health.timer`) running every 60 seconds with IMDSv2 token security. In `--mode apply`, this injection is **unconditional and self-healing**—even if `/opt/incidents` was wiped or disk metrics existed previously. It calculates:
+  $$\text{Failed Services} = \text{failed units count} + \text{stopped daemons count (dynamic discovery + core services + /etc/incidents/services.conf)}$$
+  This dynamic multi-layer inspection checks:
+  1. All crashed/failed units across the entire operating system (`systemctl list-units --state=failed`).
+  2. Dynamic discovery of all enabled daemons configured with a systemd restart policy (`Restart != no`).
+  3. Universal core production workloads (`nginx`, `docker`, `containerd`, `databases`, `microservices`, `workers`).
+  4. Optional customer overrides via `/etc/incidents/services.conf`.
   This emits `FailedServicesCount` directly to the `CWAgent` CloudWatch namespace, guaranteeing that both unhandled application crashes and stopped services trigger an immediate `ALARM` state within 60 seconds.
 
 ### 6. Universal OS & Workload Compatibility Matrix (Quiet Engineering Flex)

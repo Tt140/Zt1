@@ -1444,10 +1444,40 @@ fi
 
 FAILED_COUNT=$(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | grep -E '\.service' | wc -l)
 STOPPED_ENABLED=0
-for s in nginx docker httpd apache2 myapp postgresql mysqld redis; do
-    if systemctl is-enabled "$s" >/dev/null 2>&1; then
-        if ! systemctl is-active --quiet "$s"; then
-            STOPPED_ENABLED=$((STOPPED_ENABLED + 1))
+
+# Check explicitly configured custom services if present
+CUSTOM_SERVICES=""
+if [ -f /etc/incidents/services.conf ]; then
+    CUSTOM_SERVICES=$(grep -v '^[[:space:]]*#' /etc/incidents/services.conf 2>/dev/null | tr '\n' ' ')
+fi
+
+# Core production workloads & daemons
+CORE_SERVICES="nginx httpd apache2 docker containerd postgresql mysqld mariadb redis mongod memcached rabbitmq-server elasticsearch kafka vault consul order-gateway app myapp api backend"
+
+# Dynamic system-wide discovery of enabled daemons with restart policies
+DYNAMIC_SERVICES=""
+for svc in $(systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | awk '{print $1}'); do
+    case "$svc" in
+        *@*|cwsys_health.service|cloud-*|dmesg*|systemd-*|emergency*|rescue*) continue ;;
+    esac
+    r_policy=$(systemctl show -p Restart --value "$svc" 2>/dev/null)
+    cond_res=$(systemctl show -p ConditionResult --value "$svc" 2>/dev/null)
+    if [ -n "$r_policy" ] && [ "$r_policy" != "no" ] && [ "$cond_res" != "no" ]; then
+        DYNAMIC_SERVICES="$DYNAMIC_SERVICES $svc"
+    fi
+done
+
+ALL_CANDIDATES=$(echo "$CORE_SERVICES $CUSTOM_SERVICES $DYNAMIC_SERVICES" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+
+for s in $ALL_CANDIDATES; do
+    [ -z "$s" ] && continue
+    s_clean="${s%.service}"
+    if systemctl is-enabled "$s_clean" >/dev/null 2>&1 || systemctl is-enabled "$s" >/dev/null 2>&1; then
+        if ! systemctl is-active --quiet "$s_clean" && ! systemctl is-active --quiet "$s"; then
+            s_state=$(systemctl is-failed "$s_clean" 2>/dev/null || true)
+            if [ "$s_state" != "failed" ]; then
+                STOPPED_ENABLED=$((STOPPED_ENABLED + 1))
+            fi
         fi
     fi
 done
@@ -1659,10 +1689,40 @@ fi
 
 FAILED_COUNT=$(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | grep -E '\.service' | wc -l)
 STOPPED_ENABLED=0
-for s in nginx docker httpd apache2 myapp; do
-    if systemctl is-enabled "$s" >/dev/null 2>&1; then
-        if ! systemctl is-active --quiet "$s"; then
-            STOPPED_ENABLED=$((STOPPED_ENABLED + 1))
+
+# Check explicitly configured custom services if present
+CUSTOM_SERVICES=""
+if [ -f /etc/incidents/services.conf ]; then
+    CUSTOM_SERVICES=$(grep -v '^[[:space:]]*#' /etc/incidents/services.conf 2>/dev/null | tr '\n' ' ')
+fi
+
+# Core production workloads & daemons
+CORE_SERVICES="nginx httpd apache2 docker containerd postgresql mysqld mariadb redis mongod memcached rabbitmq-server elasticsearch kafka vault consul order-gateway app myapp api backend"
+
+# Dynamic system-wide discovery of enabled daemons with restart policies
+DYNAMIC_SERVICES=""
+for svc in $(systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | awk '{print $1}'); do
+    case "$svc" in
+        *@*|cwsys_health.service|cloud-*|dmesg*|systemd-*|emergency*|rescue*) continue ;;
+    esac
+    r_policy=$(systemctl show -p Restart --value "$svc" 2>/dev/null)
+    cond_res=$(systemctl show -p ConditionResult --value "$svc" 2>/dev/null)
+    if [ -n "$r_policy" ] && [ "$r_policy" != "no" ] && [ "$cond_res" != "no" ]; then
+        DYNAMIC_SERVICES="$DYNAMIC_SERVICES $svc"
+    fi
+done
+
+ALL_CANDIDATES=$(echo "$CORE_SERVICES $CUSTOM_SERVICES $DYNAMIC_SERVICES" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+
+for s in $ALL_CANDIDATES; do
+    [ -z "$s" ] && continue
+    s_clean="${s%.service}"
+    if systemctl is-enabled "$s_clean" >/dev/null 2>&1 || systemctl is-enabled "$s" >/dev/null 2>&1; then
+        if ! systemctl is-active --quiet "$s_clean" && ! systemctl is-active --quiet "$s"; then
+            s_state=$(systemctl is-failed "$s_clean" 2>/dev/null || true)
+            if [ "$s_state" != "failed" ]; then
+                STOPPED_ENABLED=$((STOPPED_ENABLED + 1))
+            fi
         fi
     fi
 done
@@ -2016,7 +2076,7 @@ def run_apply_mode(
         report.ec2.target_error = None
 
     # 3.3 Bootstrap Target EC2 Telemetry (CWAgent & Universal Systemd Health Pulse)
-    if not report.ec2.has_cwagent_disk_metrics:
+    if target_id and target_id != "<REQUIRED_EC2_INSTANCE_ID>":
         print(f"  📊 Bootstrapping CWAgent & Systemd Health Pulse on target instance '{target_id}'...")
         telemetry_ok = ensure_instance_telemetry(session=session, instance_id=target_id, region=region)
         if telemetry_ok:
