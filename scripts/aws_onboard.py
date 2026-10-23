@@ -2023,6 +2023,7 @@ def ensure_core_iam_roles(
     account_id: str,
     region: str,
     propagation_delay: int = 12,
+    blobs_bucket: Optional[str] = None,
 ) -> List[str]:
     """
     Ensures core IAM roles exist and are fully configured:
@@ -2031,6 +2032,8 @@ def ensure_core_iam_roles(
     3. incidents-ingest-role
     4. incidents-executor-role
     5. RemediationOperatorRole
+    6. incidents-notifier-role
+    7. incidents-slack-callback-role
 
     Idempotent lifecycle:
     - If role does not exist (NoSuchEntity), creates it via iam.create_role with valid trust policy.
@@ -2043,6 +2046,13 @@ def ensure_core_iam_roles(
     iam = session.client("iam", region_name=reg)
     remediated: List[str] = []
     roles_mutated = False
+
+    s3_resources = [
+        f"arn:aws:s3:::incidents-blobs-{account_id}/*",
+        "arn:aws:s3:::incidents-blobs-*/*",
+    ]
+    if blobs_bucket and f"arn:aws:s3:::{blobs_bucket}/*" not in s3_resources:
+        s3_resources.append(f"arn:aws:s3:::{blobs_bucket}/*")
 
     lambda_trust = {
         "Version": "2012-10-17",
@@ -2353,6 +2363,12 @@ def ensure_core_iam_roles(
                         "Action": "secretsmanager:GetSecretValue",
                         "Resource": f"arn:aws:secretsmanager:{reg}:{account_id}:secret:/incidents/*",
                     },
+                    {
+                        "Sid": "BlobsStoreAccess",
+                        "Effect": "Allow",
+                        "Action": ["s3:GetObject", "s3:PutObject"],
+                        "Resource": s3_resources,
+                    },
                 ],
             }
             iam.put_role_policy(
@@ -2379,10 +2395,13 @@ def ensure_core_iam_roles(
                         "Condition": {"StringEquals": {"ssm:resourceTag/IncidentsAgent": "true"}},
                     },
                     {
-                        "Sid": "AllowOnlyRestrictedRepairDocument",
+                        "Sid": "AllowSSMDocuments",
                         "Effect": "Allow",
                         "Action": "ssm:SendCommand",
-                        "Resource": f"arn:aws:ssm:{reg}:{account_id}:document/incidents-repair-restricted",
+                        "Resource": [
+                            f"arn:aws:ssm:{reg}:{account_id}:document/*",
+                            f"arn:aws:ssm:{reg}::document/*",
+                        ],
                     },
                     {
                         "Sid": "GetCommandResults",
@@ -2774,7 +2793,13 @@ def run_apply_mode(
 
     # 3.4 Bootstrap & Reconcile Core IAM Roles (incidents-agent-role, incidents-observer-role, RemediationOperatorRole)
     print("  🛡️ Reconciling Core IAM Roles (trust policies & execution permissions)...")
-    iam_reconciled = ensure_core_iam_roles(session=session, account_id=report.identity.account_id, region=region)
+    b_name = getattr(args, "existing_bucket", "").strip() or report.s3.expected_name or None
+    iam_reconciled = ensure_core_iam_roles(
+        session=session,
+        account_id=report.identity.account_id,
+        region=region,
+        blobs_bucket=b_name,
+    )
     for act in iam_reconciled:
         print(f"  ✓ {act}")
 

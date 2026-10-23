@@ -1799,6 +1799,53 @@ class TestCoreIamRolesReconciliation:
         ssm_cmd_stmt = next(s for s in observer_stmts if s.get("Action") == "ssm:SendCommand")
         assert "arn:aws:ssm:us-east-1:999988887777:document/incidents-observe-readonly" in ssm_cmd_stmt["Resource"]
 
+    def test_ensure_core_iam_roles_executor_s3_snapshot_access(self):
+        mock_session = MagicMock()
+        mock_iam = MagicMock()
+        mock_session.client.return_value = mock_iam
+        mock_session.region_name = "us-east-1"
+
+        from botocore.exceptions import ClientError
+        mock_iam.get_role.side_effect = ClientError({"Error": {"Code": "NoSuchEntity", "Message": "Missing"}}, "GetRole")
+
+        ensure_core_iam_roles(
+            mock_session,
+            account_id="765455961377",
+            region="us-east-1",
+            propagation_delay=0,
+            blobs_bucket="my-custom-blobs-bucket",
+        )
+
+        put_calls = {c[1]["RoleName"]: json.loads(c[1]["PolicyDocument"]) for c in mock_iam.put_role_policy.call_args_list}
+        executor_stmts = put_calls["incidents-executor-role"]["Statement"]
+
+        # Verify S3 access for snapshot storage
+        s3_stmt = next(s for s in executor_stmts if s.get("Sid") == "BlobsStoreAccess" or "s3:PutObject" in s.get("Action", []))
+        assert "s3:GetObject" in s3_stmt["Action"]
+        assert "s3:PutObject" in s3_stmt["Action"]
+        assert "arn:aws:s3:::incidents-blobs-765455961377/*" in s3_stmt["Resource"]
+        assert "arn:aws:s3:::incidents-blobs-*/*" in s3_stmt["Resource"]
+        assert "arn:aws:s3:::my-custom-blobs-bucket/*" in s3_stmt["Resource"]
+
+    def test_ensure_core_iam_roles_remediation_operator_ssm_documents_expanded(self):
+        mock_session = MagicMock()
+        mock_iam = MagicMock()
+        mock_session.client.return_value = mock_iam
+        mock_session.region_name = "us-east-1"
+
+        from botocore.exceptions import ClientError
+        mock_iam.get_role.side_effect = ClientError({"Error": {"Code": "NoSuchEntity", "Message": "Missing"}}, "GetRole")
+
+        ensure_core_iam_roles(mock_session, account_id="765455961377", region="us-east-1", propagation_delay=0)
+
+        put_calls = {c[1]["RoleName"]: json.loads(c[1]["PolicyDocument"]) for c in mock_iam.put_role_policy.call_args_list}
+        op_stmts = put_calls["RemediationOperatorRole"]["Statement"]
+
+        # Verify SSM documents permission covers both account documents and AWS default documents
+        ssm_doc_stmt = next(s for s in op_stmts if s.get("Sid") == "AllowSSMDocuments" or any("document/" in str(r) for r in s.get("Resource", [])))
+        assert "arn:aws:ssm:us-east-1:765455961377:document/*" in ssm_doc_stmt["Resource"]
+        assert "arn:aws:ssm:us-east-1::document/*" in ssm_doc_stmt["Resource"]
+
 
 class TestEnvFileInjection:
     """
