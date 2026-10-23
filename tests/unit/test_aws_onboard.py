@@ -821,6 +821,63 @@ class TestAwsOnboardPlanner:
             InstanceId="i-client-target",
         )
 
+    def test_ensure_instance_ssm_profile_reconciles_missing_cloudwatch_policy_on_existing_profile(self):
+        """
+        Verifies that when a target EC2 instance already has an IAM profile with only
+        AmazonSSMManagedInstanceCore attached, ensure_instance_ssm_profile inspects
+        the attached policies and attaches the missing CloudWatchAgentServerPolicy.
+        """
+        from scripts.aws_onboard import ensure_instance_ssm_profile
+
+        mock_session = MagicMock()
+        mock_ec2 = MagicMock()
+        mock_iam = MagicMock()
+
+        def mock_client(svc, region_name=None):
+            if svc == "ec2":
+                return mock_ec2
+            if svc == "iam":
+                return mock_iam
+            return MagicMock()
+
+        mock_session.client.side_effect = mock_client
+        mock_session.region_name = "us-east-1"
+
+        mock_ec2.describe_instances.return_value = {
+            "Reservations": [{
+                "Instances": [{
+                    "InstanceId": "i-existing-target",
+                    "State": {"Name": "running"},
+                    "IamInstanceProfile": {
+                        "Arn": "arn:aws:iam::123456789012:instance-profile/ExistingProfile"
+                    },
+                }]
+            }]
+        }
+        mock_iam.get_instance_profile.return_value = {
+            "InstanceProfile": {
+                "InstanceProfileName": "ExistingProfile",
+                "Roles": [{"RoleName": "ExistingTargetRole"}],
+            }
+        }
+        # Simulate role having only AmazonSSMManagedInstanceCore attached
+        mock_iam.list_attached_role_policies.return_value = {
+            "AttachedPolicies": [
+                {"PolicyArn": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore", "PolicyName": "AmazonSSMManagedInstanceCore"}
+            ]
+        }
+
+        success = ensure_instance_ssm_profile(mock_session, instance_id="i-existing-target", dry_run=False)
+
+        assert success is True
+        # Must attach the missing CloudWatchAgentServerPolicy
+        mock_iam.attach_role_policy.assert_called_once_with(
+            RoleName="ExistingTargetRole",
+            PolicyArn="arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy",
+        )
+        # Should NOT attempt associate_iam_instance_profile since profile already exists
+        mock_ec2.associate_iam_instance_profile.assert_not_called()
+
     def test_external_client_plan_defaults_to_embedded_strands_and_zero_dev_hardcoding(self):
         """
         Verifies that:

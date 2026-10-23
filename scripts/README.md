@@ -141,6 +141,9 @@ Traditional monitoring scripts either fail on distributions lacking `cronie` (su
 2. **Zero Downtime**: The telemetry injection, CWAgent daemon start, and systemd timer enablement run in milliseconds in the background without restarting the instance or interrupting active TCP connections.
 3. **Fail-Safe Decoupling**: In `template.yaml`, `SystemDegradedAlarm` is decoupled from disk metrics. Even before disk metrics are collected, CloudFormation deploys `SystemDegradedAlarm`, `High-CPU`, and `StatusCheckFailed` immediately, guaranteeing immediate protection.
 
+### 7. Dual-Policy IAM Role Auto-Reconciliation (`ensure_instance_ssm_profile`)
+When adopting an existing EC2 instance (Brownfield), `aws_onboard.py` inspects attached policies via `iam.list_attached_role_policies`. If either `AmazonSSMManagedInstanceCore` (Zero-Trust SSM execution & observation) or `CloudWatchAgentServerPolicy` (`cloudwatch:PutMetricData` and CWAgent metric reporting) is missing, the CLI attaches the missing policy automatically and idempotently. This eliminates `AccessDenied` errors during telemetry injection and guarantees continuous systemd health pulse reporting without manual IAM policy editing.
+
 ---
 
 ## 5. CLI Reference & Command Examples

@@ -1224,6 +1224,11 @@ def ensure_instance_ssm_profile(
         if not reservations or not reservations[0].get("Instances"):
             return False
         inst = reservations[0]["Instances"][0]
+        required_policies = [
+            "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+            "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy",
+        ]
+
         if inst.get("IamInstanceProfile", {}).get("Arn"):
             prof_arn = inst["IamInstanceProfile"]["Arn"]
             prof_name = prof_arn.split("/")[-1]
@@ -1233,13 +1238,28 @@ def ensure_instance_ssm_profile(
                 if isinstance(roles, list):
                     for role in roles:
                         r_name = role.get("RoleName") if isinstance(role, dict) else getattr(role, "RoleName", None)
-                        if r_name:
-                            iam.attach_role_policy(
-                                RoleName=r_name,
-                                PolicyArn="arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy",
-                            )
-            except Exception:
-                pass
+                        if not r_name:
+                            continue
+
+                        attached_arns = set()
+                        try:
+                            attached_resp = iam.list_attached_role_policies(RoleName=r_name)
+                            attached_arns = {p.get("PolicyArn") for p in attached_resp.get("AttachedPolicies", [])}
+                        except Exception:
+                            pass
+
+                        for pol_arn in required_policies:
+                            pol_name = pol_arn.split("/")[-1]
+                            if pol_arn not in attached_arns:
+                                try:
+                                    iam.attach_role_policy(RoleName=r_name, PolicyArn=pol_arn)
+                                    print(f"  🔐 Attached missing policy '{pol_name}' to role '{r_name}'")
+                                except Exception as att_err:
+                                    print(f"  ⚠️ Could not attach '{pol_name}' to role '{r_name}': {att_err}")
+                            else:
+                                print(f"  ✓ IAM Policy '{pol_name}' verified on role '{r_name}'")
+            except Exception as e:
+                print(f"  ⚠️ Warning reconciling instance profile '{prof_name}': {e}")
             return True
 
         role_name = "IncidentsTargetSSMInstanceRole"
@@ -1983,10 +2003,10 @@ def run_apply_mode(
         report.secrets["/incidents/approval-mac-key"].exists = True
 
     # 3.2 Bootstrap Target EC2 Profile & Tag
-    if report.ec2.target_instance and not report.ec2.target_instance.has_instance_profile:
-        print(f"  ⚙️ Bootstrapping SSM Instance Profile for {target_id}...")
+    if target_id and target_id != "<REQUIRED_EC2_INSTANCE_ID>":
+        print(f"  ⚙️ Ensuring SSM & CloudWatch IAM Profile for {target_id}...")
         ensure_instance_ssm_profile(session=session, instance_id=target_id, region=region)
-    ensure_instance_tagged(session=session, instance_id=target_id, region=region)
+        ensure_instance_tagged(session=session, instance_id=target_id, region=region)
 
     if report.ec2.target_instance and report.ec2.target_instance.state == "running":
         # Target instance is active, profiled, and tagged.

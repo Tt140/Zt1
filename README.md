@@ -3,7 +3,7 @@
 [![AWS Hackathon](https://img.shields.io/badge/AWS%20Hackathon-Strands%20Decider%202B%20%7C%20Amazon%20Bedrock-orange?style=for-the-badge)](#)
 [![YouTube Demo](https://img.shields.io/badge/YouTube%20Demo-Live%20Remediation-red?style=for-the-badge&logo=youtube)](https://www.youtube.com/watch?v=572k45RA4yo)
 [![Pattern Tags](https://img.shields.io/badge/Pattern%20Tags-%23strands--decider--2b%20%7C%20%23tool--selection-blue?style=for-the-badge)](#-mandatory-hackathon-tags)
-[![Pytest Suite](https://img.shields.io/badge/pytest-545%20passed%20(100%25)-brightgreen?style=for-the-badge&logo=pytest)](tests/README.md)
+[![Pytest Suite](https://img.shields.io/badge/pytest-546%20passed%20(100%25)-brightgreen?style=for-the-badge&logo=pytest)](tests/README.md)
 [![License](https://img.shields.io/badge/License-Apache--2.0-green?style=for-the-badge)](LICENSE)
 [![Zero Runbooks](https://img.shields.io/badge/Zero--Runbooks-100%25%20Dynamic%20Reasoning-blue?style=for-the-badge)](tests/test_no_runbooks.py)
 [![Security Invariants](https://img.shields.io/badge/Security%20Invariants-16%20Enforced%20(I--01..I--16)-red?style=for-the-badge)](src/README.md#4-the-16-security-invariants)
@@ -80,7 +80,7 @@ This repository is strictly structured into modular, self-documenting subsystems
 | **Infrastructure as Code** | [`infra/README.md`](infra/README.md) | AWS SAM `template.yaml`, Zero-Trust SSM Documents (`incidents-observe-readonly`, `incidents-repair-restricted`), conditional provisioning, and SCP-immune architecture. |
 | **Onboarding & Delta CLI** | [`scripts/README.md`](scripts/README.md) | 7-Layer Deep Discovery Engine (`aws_onboard.py`), Greenfield vs Brownfield Delta Planning, IAM propagation retry backoff, dead-stack self-healing, and CFN failure forensic extraction. |
 | **Universal Live Investigation** | [`demos/README.md`](demos/README.md) | Zero-scripted dynamic incident investigation (`run_live_incident.py`), auto-discovery via `IncidentsAgent=true`, and Slack Socket Mode interactive approval. |
-| **Verification & Tests** | [`tests/README.md`](tests/README.md) | **545 automated tests** (100% pass rate), cross-backend storage conformance (`DynamoDB`, `SQLite`, `InMemory`), defensive shell injection hardening, and E2E simulation. |
+| **Verification & Tests** | [`tests/README.md`](tests/README.md) | **546 automated tests** (100% pass rate), cross-backend storage conformance (`DynamoDB`, `SQLite`, `InMemory`), defensive shell injection hardening, and E2E simulation. |
 
 ---
 
@@ -226,7 +226,7 @@ sam deploy --guided
 
 ---
 
-### 2. Running the Automated Test Suite (545 Tests - 100% Pass Rate)
+### 2. Running the Automated Test Suite (546 Tests - 100% Pass Rate)
 Install dependencies and run the complete test suite:
 ```bash
 pip install -r requirements-dev.txt
