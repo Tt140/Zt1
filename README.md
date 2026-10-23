@@ -217,7 +217,18 @@ This platform was engineered from first principles to be **100% non-intrusive, w
 
 ## 🧪 Quickstart: Running the Agent & Tests
 
-### 1. 1-Click Reproducible Deployment via AWS SAM
+### 1. Zero-Touch Onboarding & Environment Injection (`-E` / `--env-file`)
+Adopt an existing production EC2 instance or deploy a dedicated sandboxed environment in a single command, automatically injecting credentials from your local `.env` into AWS Secrets Manager and operational parameters into CloudFormation:
+```bash
+python3 scripts/aws_onboard.py --mode apply --instance-id <INSTANCE_ID> -E .env --yes
+```
+* **Strict Security Segregation**: Sensitive credentials (`DEEPSEEK_API_KEY`, `APPROVAL_MAC_KEY_HEX`, Slack tokens) are routed directly and securely into **AWS Secrets Manager** via HTTPS API.
+* **Operational Configuration**: Model identifiers and routing parameters (`DEEPSEEK_FLASH_MODEL`, `DEEPSEEK_BASE_URL`, `STRANDS_URL`, etc.) are passed as SAM parameter overrides to update the Lambda environment.
+* **Git Safe**: `template.yaml` remains 100% free of secrets, and `.env` is strictly protected inside `.gitignore`.
+
+---
+
+### 2. 1-Click Reproducible Deployment via AWS SAM
 Deploy the complete production stack (6 Serverless Lambdas, 3 DynamoDB Tables, 5 CloudWatch Alarms, and Least-Privilege IAM Boundaries) into any AWS account within two minutes:
 ```bash
 sam build
@@ -226,7 +237,7 @@ sam deploy --guided
 
 ---
 
-### 2. Running the Automated Test Suite (546 Tests - 100% Pass Rate)
+### 3. Running the Automated Test Suite (554 Tests - 100% Pass Rate)
 Install dependencies and run the complete test suite:
 ```bash
 pip install -r requirements-dev.txt

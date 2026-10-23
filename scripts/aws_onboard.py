@@ -912,6 +912,7 @@ def build_cfn_parameters(
     create_target_vps: bool = False,
     existing_bucket: Optional[str] = None,
     is_apply: bool = False,
+    injected_params: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, str], List[str], str]:
     """
     Computes exact parameter overrides for template.yaml based on audit discovery,
@@ -960,12 +961,30 @@ def build_cfn_parameters(
         strands_url = raw_strands
     params["StrandsUrl"] = strands_url
 
-    # 3. Models
+    # 3. Models & Operational Configuration
     params["NovaFlashModelId"] = "amazon.nova-lite-v1:0"
     params["NovaProModelId"] = "amazon.nova-pro-v1:0"
     params["DeepSeekBaseUrl"] = "https://bedrock-mantle.us-east-1.api.aws/v1"
     params["DeepSeekFlashModel"] = "deepseek.v3.1"
     params["DeepSeekProModel"] = "deepseek.v3.2"
+
+    if injected_params:
+        if "NOVA_FLASH_MODEL_ID" in injected_params:
+            params["NovaFlashModelId"] = injected_params["NOVA_FLASH_MODEL_ID"]
+        if "NOVA_PRO_MODEL_ID" in injected_params:
+            params["NovaProModelId"] = injected_params["NOVA_PRO_MODEL_ID"]
+        if "DEEPSEEK_BASE_URL" in injected_params:
+            params["DeepSeekBaseUrl"] = injected_params["DEEPSEEK_BASE_URL"]
+        if "DEEPSEEK_FLASH_MODEL" in injected_params:
+            params["DeepSeekFlashModel"] = injected_params["DEEPSEEK_FLASH_MODEL"]
+        if "DEEPSEEK_PRO_MODEL" in injected_params:
+            params["DeepSeekProModel"] = injected_params["DEEPSEEK_PRO_MODEL"]
+        if "STRANDS_URL" in injected_params and not strands_override:
+            params["StrandsUrl"] = injected_params["STRANDS_URL"]
+        if "SLACK_AUTHORIZED_APPROVERS" in injected_params:
+            params["SlackAuthorizedApprovers"] = injected_params["SLACK_AUTHORIZED_APPROVERS"]
+        if "SLACK_CHANNEL" in injected_params:
+            params["SlackChannel"] = injected_params["SLACK_CHANNEL"]
 
     # 4. DynamoDB Tables
     if report.dynamodb.all_ready:
@@ -1063,6 +1082,65 @@ def build_cfn_parameters(
 build_plan = build_cfn_parameters
 
 
+def parse_env_file(env_path: str) -> Dict[str, str]:
+    """
+    Parses a .env file into a dictionary of key-value pairs.
+    Handles comments, empty lines, and single/double quoted values safely.
+    """
+    if not env_path or not os.path.exists(env_path):
+        if env_path:
+            print(f"  ⚠️ Notice: Specified env file '{env_path}' was not found; skipping environment injection.")
+        return {}
+    env_vars: Dict[str, str] = {}
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                    v = v[1:-1]
+                if k and v:
+                    env_vars[k] = v
+    except Exception as exc:
+        print(f"  ⚠️ Warning: Could not parse env file '{env_path}': {exc}")
+    return env_vars
+
+
+def split_env_vars(env_vars: Dict[str, str]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Splits raw parsed environment variables into:
+    1. Secrets (for AWS Secrets Manager: credentials, HMAC tokens, webhooks)
+    2. Configuration Parameters (for CloudFormation / SAM overrides: models, endpoints, approvers)
+    """
+    secrets_keys = {
+        "DEEPSEEK_API_KEY",
+        "APPROVAL_MAC_KEY_HEX",
+        "SLACK_WEBHOOK_URL",
+        "SLACK_APP_TOKEN",
+        "SLACK_REFRESH_TOKEN",
+    }
+    params_keys = {
+        "DEEPSEEK_BASE_URL",
+        "DEEPSEEK_FLASH_MODEL",
+        "DEEPSEEK_PRO_MODEL",
+        "NOVA_FLASH_MODEL_ID",
+        "NOVA_PRO_MODEL_ID",
+        "STRANDS_URL",
+        "SLACK_AUTHORIZED_APPROVERS",
+        "SLACK_CHANNEL",
+    }
+
+    injected_secrets = {k: v for k, v in env_vars.items() if k in secrets_keys and v.strip()}
+    injected_params = {k: v for k, v in env_vars.items() if k in params_keys and v.strip()}
+    return injected_secrets, injected_params
+
+
 # ── Client Account Bootstrap Helpers ─────────────────────────────────────────
 
 def ensure_client_secrets(
@@ -1071,14 +1149,14 @@ def ensure_client_secrets(
     region: Optional[str] = None,
     project_root: Optional[str] = None,
     deepseek_api_key: Optional[str] = None,
+    injected_secrets: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """
     Checks and auto-provisions core secrets in AWS Secrets Manager for the client account:
-    1. /incidents/approval-mac-key: generates 32-byte cryptographically secure hex key.
-    2. /incidents/deepseek-api-key: created with user-provided key if --deepseek-api-key is supplied;
-       otherwise created with safe placeholder 'PLACEHOLDER_SET_YOUR_OWN_KEY_IN_SECRETS_MANAGER'
-       to ensure CloudFormation deployment succeeds without uploading developer credentials.
-    Strictly isolated: Never reads local .env file or uploads developer's private keys.
+    1. /incidents/approval-mac-key: generates 32-byte cryptographically secure hex key (or uses APPROVAL_MAC_KEY_HEX).
+    2. /incidents/deepseek-api-key: created with user-provided key if supplied via CLI or .env file (-E / --env-file);
+       if previously created with placeholder, automatically updates it to the valid key.
+    3. Slack secrets: /incidents/slack-webhook-url, /incidents/slack-app-token, etc., if supplied in .env file.
     """
     created_actions: List[str] = []
     reg = region or session.region_name or "us-east-1"
@@ -1086,6 +1164,8 @@ def ensure_client_secrets(
         sm = session.client("secretsmanager", region_name=reg)
     except Exception as e:
         return [f"Could not initialize secretsmanager client: {e}"]
+
+    injected = injected_secrets or {}
 
     def _secret_exists(name: str) -> bool:
         try:
@@ -1096,9 +1176,47 @@ def ensure_client_secrets(
         except Exception:
             return False
 
+    def _get_secret_value(name: str) -> Optional[str]:
+        try:
+            res = sm.get_secret_value(SecretId=name)
+            return res.get("SecretString", "")
+        except Exception:
+            return None
+
+    def _put_or_create_secret(name: str, desc: str, val: str) -> None:
+        if not val:
+            return
+        if not _secret_exists(name):
+            if dry_run:
+                created_actions.append(f"[Dry Run] Would create secret '{name}'")
+            else:
+                try:
+                    sm.create_secret(Name=name, Description=desc, SecretString=val)
+                    created_actions.append(f"Created secret '{name}' in Secrets Manager")
+                except Exception as e:
+                    created_actions.append(f"Failed to create secret '{name}': {e}")
+        else:
+            current_val = _get_secret_value(name)
+            if current_val != val:
+                if dry_run:
+                    created_actions.append(f"[Dry Run] Would update secret '{name}' with live credential")
+                else:
+                    try:
+                        sm.put_secret_value(SecretId=name, SecretString=val)
+                        created_actions.append(f"Updated secret '{name}' with live credential in Secrets Manager")
+                    except Exception as e:
+                        created_actions.append(f"Failed to update secret '{name}': {e}")
+
     # 1. /incidents/approval-mac-key
     mac_key_name = "/incidents/approval-mac-key"
-    if not _secret_exists(mac_key_name):
+    injected_mac = injected.get("APPROVAL_MAC_KEY_HEX", "").strip()
+    if injected_mac:
+        _put_or_create_secret(
+            mac_key_name,
+            "HMAC-SHA256 authentication key for Tier 2 autonomous incident remediation",
+            injected_mac,
+        )
+    elif not _secret_exists(mac_key_name):
         if dry_run:
             created_actions.append(f"[Dry Run] Would create secret '{mac_key_name}' with generated HMAC-SHA256 key")
         else:
@@ -1115,38 +1233,41 @@ def ensure_client_secrets(
 
     # 2. /incidents/deepseek-api-key
     ds_key_name = "/incidents/deepseek-api-key"
-    if not _secret_exists(ds_key_name):
-        ds_val = (deepseek_api_key or "").strip()
-        if ds_val:
-            if dry_run:
-                created_actions.append(f"[Dry Run] Would create secret '{ds_key_name}' with user-provided API key")
-            else:
-                try:
-                    sm.create_secret(
-                        Name=ds_key_name,
-                        Description="Inference API Key for Bedrock Mantle / DeepSeek autonomous agent",
-                        SecretString=ds_val,
-                    )
-                    created_actions.append(f"Created secret '{ds_key_name}' from provided --deepseek-api-key")
-                except Exception as e:
-                    created_actions.append(f"Failed to create secret '{ds_key_name}': {e}")
+    ds_val = (deepseek_api_key or "").strip() or injected.get("DEEPSEEK_API_KEY", "").strip()
+    if ds_val:
+        _put_or_create_secret(
+            ds_key_name,
+            "Inference API Key for Bedrock Mantle / DeepSeek autonomous agent",
+            ds_val,
+        )
+    elif not _secret_exists(ds_key_name):
+        placeholder = "PLACEHOLDER_SET_YOUR_OWN_KEY_IN_SECRETS_MANAGER"
+        if dry_run:
+            created_actions.append(f"[Dry Run] Would create secret '{ds_key_name}' with safe placeholder")
         else:
-            placeholder = "PLACEHOLDER_SET_YOUR_OWN_KEY_IN_SECRETS_MANAGER"
-            if dry_run:
-                created_actions.append(f"[Dry Run] Would create secret '{ds_key_name}' with safe placeholder")
-            else:
-                try:
-                    sm.create_secret(
-                        Name=ds_key_name,
-                        Description="Inference API Key placeholder (Update with your own key)",
-                        SecretString=placeholder,
-                    )
-                    created_actions.append(
-                        f"Created secret '{ds_key_name}' with safe placeholder '{placeholder}' (Action required: Update with your own API key in AWS Secrets Manager)"
-                    )
-                    print(f"  ⚠️ Notice: Created '{ds_key_name}' with safe placeholder. Please set your own API key in AWS Secrets Manager.")
-                except Exception as e:
-                    created_actions.append(f"Failed to create secret '{ds_key_name}': {e}")
+            try:
+                sm.create_secret(
+                    Name=ds_key_name,
+                    Description="Inference API Key placeholder (Update with your own key)",
+                    SecretString=placeholder,
+                )
+                created_actions.append(
+                    f"Created secret '{ds_key_name}' with safe placeholder '{placeholder}' (Action required: Update with your own API key in AWS Secrets Manager)"
+                )
+                print(f"  ⚠️ Notice: Created '{ds_key_name}' with safe placeholder. Please set your own API key in AWS Secrets Manager.")
+            except Exception as e:
+                created_actions.append(f"Failed to create secret '{ds_key_name}': {e}")
+
+    # 3. Optional Slack Secrets
+    optional_secret_mappings = [
+        ("SLACK_WEBHOOK_URL", "/incidents/slack-webhook-url", "Slack Webhook URL for incident notifications"),
+        ("SLACK_APP_TOKEN", "/incidents/slack-app-token", "Slack App-level token for Socket Mode"),
+        ("SLACK_REFRESH_TOKEN", "/incidents/slack-refresh-token", "Slack refresh token for token rotation"),
+    ]
+    for env_k, sec_name, sec_desc in optional_secret_mappings:
+        s_val = injected.get(env_k, "").strip()
+        if s_val:
+            _put_or_create_secret(sec_name, sec_desc, s_val)
 
     return created_actions
 
@@ -2276,6 +2397,8 @@ def run_apply_mode(
     report: AuditReport,
     project_root: str,
     args: argparse.Namespace,
+    injected_secrets: Optional[Dict[str, str]] = None,
+    injected_params: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     Executes governed apply mode:
@@ -2288,6 +2411,16 @@ def run_apply_mode(
     """
     create_vps = getattr(args, "create_target_vps", False)
     target_id = args.instance_id.strip()
+
+    # Load injected env variables if passed via -E / --env-file
+    env_file_path = getattr(args, "env_file", "").strip()
+    if env_file_path and (injected_secrets is None or injected_params is None):
+        raw_env = parse_env_file(env_file_path)
+        s_vars, p_vars = split_env_vars(raw_env)
+        if injected_secrets is None:
+            injected_secrets = s_vars
+        if injected_params is None:
+            injected_params = p_vars
 
     if not target_id and not create_vps:
         print("\n❌ ERROR: Neither '--instance-id' nor '-T' / '--create-target-vps' was specified.")
@@ -2313,6 +2446,7 @@ def run_apply_mode(
         stack_name=args.stack_name,
         create_target_vps=create_vps and not target_id,
         is_apply=True,
+        injected_params=injected_params,
     )
     print_plan(report, params, pre_actions, sam_command)
 
@@ -2348,6 +2482,7 @@ def run_apply_mode(
         region=region,
         project_root=project_root,
         deepseek_api_key=getattr(args, "deepseek_api_key", "").strip() or None,
+        injected_secrets=injected_secrets,
     )
     for s_res in secret_results:
         print(f"  🔐 {s_res}")
@@ -2407,6 +2542,7 @@ def run_apply_mode(
         stack_name=args.stack_name,
         existing_bucket=getattr(args, "existing_bucket", "").strip() or None,
         is_apply=True,
+        injected_params=injected_params,
     )
 
     # 4. SAM deployment
@@ -2841,6 +2977,14 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         default="",
         help="DeepSeek API key to explicitly store in client AWS Secrets Manager (/incidents/deepseek-api-key)",
     )
+    parser.add_argument(
+        "-E",
+        "--env-file",
+        nargs="?",
+        const=".env",
+        default="",
+        help="Path to .env configuration file (defaults to .env if -E is passed without path). Automatically injects secrets into AWS Secrets Manager and operational parameters into CloudFormation/Lambda without manual CLI flags.",
+    )
     default_region = (
         os.environ.get("AWS_DEFAULT_REGION")
         or os.environ.get("AWS_REGION")
@@ -2915,6 +3059,19 @@ def main():
             print(f"\n📁 Report successfully saved to: {args.json_out}")
         return
 
+    # Load environment configuration if -E / --env-file passed
+    env_file_path = getattr(args, "env_file", "").strip()
+    injected_secrets, injected_params = ({}, {})
+    if env_file_path:
+        raw_env = parse_env_file(env_file_path)
+        if raw_env:
+            injected_secrets, injected_params = split_env_vars(raw_env)
+            print(f"📄 Loaded environment configuration from: {env_file_path}")
+            if injected_secrets:
+                print(f"   🔐 Detected secrets for AWS Secrets Manager: {', '.join(sorted(injected_secrets.keys()))}")
+            if injected_params:
+                print(f"   ⚙️ Detected configuration parameters for SAM: {', '.join(sorted(injected_params.keys()))}")
+
     # 3. Plan Mode
     if args.mode == "plan":
         print_audit_summary(report)
@@ -2924,6 +3081,7 @@ def main():
             stack_name=args.stack_name,
             create_target_vps=args.create_target_vps,
             existing_bucket=args.existing_bucket.strip() or None,
+            injected_params=injected_params,
         )
         print_plan(report, params, pre_actions, sam_command)
 
@@ -2958,6 +3116,8 @@ def main():
             report=report,
             project_root=project_root,
             args=args,
+            injected_secrets=injected_secrets,
+            injected_params=injected_params,
         )
 
 

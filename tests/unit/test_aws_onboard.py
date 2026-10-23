@@ -47,6 +47,10 @@ from scripts.aws_onboard import (
     run_full_audit,
     _is_trust_policy_valid,
     ensure_core_iam_roles,
+    parse_env_file,
+    split_env_vars,
+    ensure_client_secrets,
+    parse_args,
 )
 
 
@@ -1676,6 +1680,108 @@ class TestCoreIamRolesReconciliation:
 
         params, pre_actions, _ = build_cfn_parameters(report)
         assert any("Reconcile IAM Role Trust Policy (incidents-agent-role)" in a for a in pre_actions)
+
+
+class TestEnvFileInjection:
+    """
+    Tests for -E / --env-file automated environment injection and dual-topology routing.
+    """
+
+    def test_parse_env_file_handles_comments_quotes_and_empty_lines(self, tmp_path):
+        env_content = """
+        # Sample configuration
+        DEEPSEEK_API_KEY="sk-secret-12345"
+        DEEPSEEK_BASE_URL='https://bedrock-mantle.us-east-1.api.aws/v1'
+        
+        # Unquoted and spaced
+        DEEPSEEK_FLASH_MODEL = deepseek.v3.2
+        EMPTY_VAL=
+        """
+        env_file = tmp_path / ".env.test"
+        env_file.write_text(env_content, encoding="utf-8")
+
+        parsed = parse_env_file(str(env_file))
+        assert parsed["DEEPSEEK_API_KEY"] == "sk-secret-12345"
+        assert parsed["DEEPSEEK_BASE_URL"] == "https://bedrock-mantle.us-east-1.api.aws/v1"
+        assert parsed["DEEPSEEK_FLASH_MODEL"] == "deepseek.v3.2"
+        assert "EMPTY_VAL" not in parsed
+
+    def test_split_env_vars_categorizes_secrets_and_parameters(self):
+        raw = {
+            "DEEPSEEK_API_KEY": "sk-real-token",
+            "APPROVAL_MAC_KEY_HEX": "0123456789abcdef",
+            "SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/...",
+            "DEEPSEEK_BASE_URL": "https://bedrock-mantle.us-east-1.api.aws/v1",
+            "DEEPSEEK_FLASH_MODEL": "deepseek.v3.2",
+            "SLACK_AUTHORIZED_APPROVERS": "U123456,U789012",
+        }
+        secrets, params = split_env_vars(raw)
+        assert set(secrets.keys()) == {"DEEPSEEK_API_KEY", "APPROVAL_MAC_KEY_HEX", "SLACK_WEBHOOK_URL"}
+        assert set(params.keys()) == {"DEEPSEEK_BASE_URL", "DEEPSEEK_FLASH_MODEL", "SLACK_AUTHORIZED_APPROVERS"}
+
+    def test_build_cfn_parameters_injects_env_params_and_protects_secrets(self):
+        ident = _make_identity()
+        ec2 = _make_ec2_report(has_security_tag=True, has_cwagent_disk=True)
+        ddb = _make_dynamodb_report(all_ready=True)
+        s3 = _make_s3_report(exists=True)
+        ssm = _make_ssm_report(all_ready=True)
+        secrets_rep = _make_secrets_report(all_exist=True)
+        stack = _make_stack_report()
+        iam = _make_iam_report(all_ready=True)
+
+        report = AuditReport(
+            identity=ident, ec2=ec2, dynamodb=ddb, s3=s3, ssm=ssm,
+            iam=iam, secrets=secrets_rep, stack=stack, overall_status="READY",
+        )
+
+        injected_params = {
+            "DEEPSEEK_FLASH_MODEL": "deepseek.v3.2",
+            "DEEPSEEK_BASE_URL": "https://custom.endpoint.internal/v1",
+            "SLACK_AUTHORIZED_APPROVERS": "U123456",
+        }
+        params, _, sam_cmd = build_cfn_parameters(report, injected_params=injected_params)
+
+        assert params["DeepSeekFlashModel"] == "deepseek.v3.2"
+        assert params["DeepSeekBaseUrl"] == "https://custom.endpoint.internal/v1"
+        assert params["SlackAuthorizedApprovers"] == "U123456"
+        assert "DEEPSEEK_API_KEY" not in params
+        assert "DeepSeekFlashModel=deepseek.v3.2" in sam_cmd
+
+    def test_ensure_client_secrets_updates_existing_placeholder_with_live_token(self):
+        mock_session = MagicMock()
+        mock_sm = MagicMock()
+        mock_session.client.return_value = mock_sm
+        mock_session.region_name = "us-east-1"
+
+        # Secret exists but contains placeholder
+        mock_sm.describe_secret.return_value = {"Name": "/incidents/deepseek-api-key"}
+        mock_sm.get_secret_value.return_value = {"SecretString": "PLACEHOLDER_SET_YOUR_OWN_KEY_IN_SECRETS_MANAGER"}
+
+        injected_secrets = {"DEEPSEEK_API_KEY": "bedrock-live-token-999"}
+        results = ensure_client_secrets(mock_session, injected_secrets=injected_secrets)
+
+        mock_sm.put_secret_value.assert_called_once_with(
+            SecretId="/incidents/deepseek-api-key",
+            SecretString="bedrock-live-token-999",
+        )
+        assert any("Updated secret '/incidents/deepseek-api-key' with live credential" in r for r in results)
+
+    def test_cli_parser_env_file_flag(self):
+        # Default with -E
+        args_default = parse_args(["--mode", "apply", "-E", "--instance-id", "i-123"])
+        assert args_default.env_file == ".env"
+
+        # Explicit custom path
+        args_custom = parse_args(["--mode", "apply", "-E", "my_custom.env", "--instance-id", "i-123"])
+        assert args_custom.env_file == "my_custom.env"
+
+        # Long option
+        args_long = parse_args(["--mode", "plan", "--env-file", "prod.env", "--instance-id", "i-123"])
+        assert args_long.env_file == "prod.env"
+
+        # Omitted
+        args_omitted = parse_args(["--mode", "audit"])
+        assert args_omitted.env_file == ""
 
 
 

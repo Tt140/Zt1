@@ -149,6 +149,39 @@ Traditional monitoring scripts either fail on distributions lacking `cronie` (su
 ### 7. Dual-Policy IAM Role Auto-Reconciliation (`ensure_instance_ssm_profile`)
 When adopting an existing EC2 instance (Brownfield), `aws_onboard.py` inspects attached policies via `iam.list_attached_role_policies`. If either `AmazonSSMManagedInstanceCore` (Zero-Trust SSM execution & observation) or `CloudWatchAgentServerPolicy` (`cloudwatch:PutMetricData` and CWAgent metric reporting) is missing, the CLI attaches the missing policy automatically and idempotently. This eliminates `AccessDenied` errors during telemetry injection and guarantees continuous systemd health pulse reporting without manual IAM policy editing.
 
+### 8. Zero-Touch Deployment with Environment Injection (`-E` / `--env-file`)
+
+To eliminate manual credential extraction, shell parsing, and the accidental persistence of `PLACEHOLDER` secrets in AWS Secrets Manager, `aws_onboard.py` supports direct environment file injection via `-E` or `--env-file`:
+
+```bash
+# One-Command Zero-Touch Deployment with automatic environment injection:
+python3 scripts/aws_onboard.py --mode apply --instance-id <INSTANCE_ID> -E .env --yes
+```
+
+#### Dual-Topology Architecture (Secrets vs Configuration Parameters)
+`aws_onboard.py` parses the target `.env` file and strictly segregates variables into two isolated deployment paths:
+
+| `.env` Key | Target Destination in AWS | Architectural Role & Security Guarantee |
+|---|---|---|
+| `DEEPSEEK_API_KEY` | `AWS Secrets Manager` (`/incidents/deepseek-api-key`) | Live Bedrock Mantle / DeepSeek Bearer Token. Automatically overwrites any previous `PLACEHOLDER` secret via `sm.put_secret_value`. Never logged or passed via SAM CLI. |
+| `APPROVAL_MAC_KEY_HEX` | `AWS Secrets Manager` (`/incidents/approval-mac-key`) | 32-byte HMAC-SHA256 signing secret for Tier 2 autonomous remediation approvals. |
+| `SLACK_WEBHOOK_URL` | `AWS Secrets Manager` (`/incidents/slack-webhook-url`) | Slack Webhook URL for autonomous incident alerting. |
+| `SLACK_APP_TOKEN` | `AWS Secrets Manager` (`/incidents/slack-app-token`) | Slack App-level token for Socket Mode incident investigation. |
+| `SLACK_REFRESH_TOKEN` | `AWS Secrets Manager` (`/incidents/slack-refresh-token`) | Slack token rotation secret. |
+| `DEEPSEEK_BASE_URL` | `CloudFormation / SAM Parameter` (`DeepSeekBaseUrl`) | Bedrock Mantle API endpoint passed as a parameter override to update Lambda environment variables. |
+| `DEEPSEEK_FLASH_MODEL` | `CloudFormation / SAM Parameter` (`DeepSeekFlashModel`) | Fast observation and triage model (`deepseek.v3.1` or `deepseek.v3.2`). |
+| `DEEPSEEK_PRO_MODEL` | `CloudFormation / SAM Parameter` (`DeepSeekProModel`) | Deep reasoning and root cause synthesis model (`deepseek.v3.2`). |
+| `NOVA_FLASH_MODEL_ID` | `CloudFormation / SAM Parameter` (`NovaFlashModelId`) | Fallback fast model (`amazon.nova-lite-v1:0`). |
+| `NOVA_PRO_MODEL_ID` | `CloudFormation / SAM Parameter` (`NovaProModelId`) | Fallback deep model (`amazon.nova-pro-v1:0`). |
+| `STRANDS_URL` | `CloudFormation / SAM Parameter` (`StrandsUrl`) | Strands Decider routing endpoint (or `embedded`). |
+| `SLACK_AUTHORIZED_APPROVERS` | `CloudFormation / SAM Parameter` (`SlackAuthorizedApprovers`) | Comma-separated list of approved Slack user IDs for Tier 2 cryptographic actions. |
+| `SLACK_CHANNEL` | `CloudFormation / SAM Parameter` (`SlackChannel`) | Target Slack channel for security alerts. |
+
+#### Security & Git Hygiene Invariants:
+1. **Zero Git Leaks**: `template.yaml` remains 100% decoupled from private credentials. `.env` files remain strictly ignored by `.gitignore`.
+2. **Zero Plaintext Logs**: Secrets are sent directly to AWS Secrets Manager using boto3 HTTPS API calls; they are never appended to `sam deploy --parameter-overrides` commands or echoed in terminal logs.
+3. **Automatic Placeholder Overwrite**: If `/incidents/deepseek-api-key` was previously initialized as a `PLACEHOLDER`, passing `-E` automatically overwrites it with the valid active credential.
+
 ---
 
 ## 5. CLI Reference & Command Examples
@@ -163,6 +196,7 @@ When adopting an existing EC2 instance (Brownfield), `aws_onboard.py` inspects a
 | `--instance-id` | N/A | Adopts an existing EC2 instance ID for autonomous remediation. | `""` |
 | `--existing-bucket` | N/A | Adopts an existing customer S3 bucket for incident blobs (disables automatic bucket creation). | `""` |
 | `--deepseek-api-key` | N/A | Stores a DeepSeek API key into Secrets Manager (`/incidents/deepseek-api-key`). | `""` |
+| `--env-file` | `-E` | Path to `.env` configuration file (defaults to `.env` if `-E` is passed without path). Automatically injects secrets into Secrets Manager and parameters into CloudFormation. | `""` |
 | `--stack-name` | N/A | CloudFormation / SAM stack name. | `autonomous-secops-agent` |
 | `--strands-url` | N/A | URL for external Strands Decider service or `embedded` for in-memory router. | `embedded` |
 | `--global-view` | N/A | Scans all enabled AWS regions for running EC2 instances and EventStore tables. | `False` |
