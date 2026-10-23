@@ -431,6 +431,24 @@ class TestResolveSecret:
             )
             assert val == ""
 
+    def test_resource_not_found_handled_cleanly(self, monkeypatch):
+        from handlers.shared import _resolve_secret
+        from botocore.exceptions import ClientError
+        _resolve_secret.cache_clear()
+        monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
+        mock_sm = MagicMock()
+        mock_sm.get_secret_value.side_effect = ClientError(
+            {"Error": {"Code": "ResourceNotFoundException", "Message": "Secrets Manager can't find the specified secret."}},
+            "GetSecretValue",
+        )
+        with patch("boto3.client", return_value=mock_sm):
+            val = _resolve_secret(
+                env_var_name="SLACK_WEBHOOK_URL",
+                secret_arn_env_var="SLACK_WEBHOOK_SECRET_ARN",
+                default_secret_id="/incidents/slack-webhook-url",
+            )
+            assert val == ""
+
     def test_get_approval_mac_key_resolution(self, monkeypatch):
         from handlers.shared import get_approval_mac_key, _resolve_secret
         get_approval_mac_key.cache_clear()

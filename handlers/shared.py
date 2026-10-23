@@ -13,6 +13,7 @@ from functools import lru_cache
 from typing import Optional
 
 import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -74,6 +75,16 @@ def _resolve_secret(env_var_name: str, secret_arn_env_var: str, default_secret_i
         secret_val = resp.get("SecretString", "")
         if secret_val:
             return secret_val.strip()
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code == "ResourceNotFoundException":
+            logger.debug(
+                f"Optional secret '{secret_id}' not found in Secrets Manager for {env_var_name} — skipping cleanly"
+            )
+            return ""
+        logger.warning(
+            f"Failed to resolve secret from Secrets Manager ({secret_id}) for {env_var_name}: {e}"
+        )
     except Exception as e:
         logger.warning(
             f"Failed to resolve secret from Secrets Manager ({secret_id}) for {env_var_name}: {e}"

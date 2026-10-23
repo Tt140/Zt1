@@ -342,7 +342,7 @@ Resources:
                   - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/incidents-dedup"
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-agent"
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-*"
 
   AgentRole:
     Type: AWS::IAM::Role
@@ -398,11 +398,7 @@ Resources:
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/incidents/*"
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource:
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-observer"
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-executor"
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-notifier"
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-agent"
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-*"
 
   ObserverRole:
     Type: AWS::IAM::Role
@@ -417,6 +413,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
       Policies:
         - PolicyName: incidents-observer-policy
           PolicyDocument:
@@ -499,7 +496,7 @@ Resources:
                   - !Sub "arn:aws:iam::${AWS::AccountId}:role/RemediationOperatorRole"
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-notifier"
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:incidents-*"
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/incidents/*"
