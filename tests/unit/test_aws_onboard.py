@@ -702,10 +702,10 @@ class TestAwsOnboardPlanner:
                             actions = stmt.get("Action", [])
                             assert "dynamodb:PutItem" in actions
                             assert "dynamodb:GetItem" in actions
+                            assert "dynamodb:UpdateItem" in actions, f"UpdateItem required for META last_seq CAS in {rname}"
                             assert "dynamodb:Query" in actions
                             assert "dynamodb:DescribeTable" in actions
                             assert "dynamodb:DeleteItem" not in actions, f"Violation: DeleteItem found in {rname} EventsTableAppendOnly"
-                            assert "dynamodb:UpdateItem" not in actions, f"Violation: UpdateItem found in {rname} EventsTableAppendOnly"
 
         # Must protect events in IngestRole, AgentRole, ObserverRole, ExecutorRole, SlackCallbackRole
         assert found_append_only_stmts >= 5
