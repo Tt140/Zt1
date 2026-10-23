@@ -473,7 +473,11 @@ def audit_iam_roles(session: boto3.Session) -> IAMLayerReport:
     required_roles = [
         "incidents-agent-role",
         "incidents-observer-role",
+        "incidents-ingest-role",
+        "incidents-executor-role",
         "RemediationOperatorRole",
+        "incidents-notifier-role",
+        "incidents-slack-callback-role",
     ]
 
     roles_report: Dict[str, IAMRoleReport] = {}
@@ -1019,12 +1023,12 @@ def build_cfn_parameters(
 
     # 7. IAM Core Roles
     any_iam_role_exists = any(r.exists for r in report.iam.roles.values())
-    if report.iam.all_ready:
+    if is_apply:
+        # In apply mode, ensure_core_iam_roles idempotently reconciles and creates
+        # all core IAM roles upfront via boto3 before SAM deployment, completely avoiding
+        # CloudFormation ResourceExistenceCheck / EntityAlreadyExists collisions.
         params["CreateCoreIamRoles"] = "false"
-    elif is_apply and any_iam_role_exists:
-        # Reconciled in-place during apply to prevent CloudFormation EntityAlreadyExists errors
-        params["CreateCoreIamRoles"] = "false"
-    elif any_iam_role_exists:
+    elif report.iam.all_ready or any_iam_role_exists:
         params["CreateCoreIamRoles"] = "false"
     else:
         params["CreateCoreIamRoles"] = "true"
@@ -2078,21 +2082,31 @@ def ensure_core_iam_roles(
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code")
             if code == "NoSuchEntity":
-                try:
-                    iam.create_role(
-                        RoleName=role_name,
-                        AssumeRolePolicyDocument=json.dumps(trust_doc),
-                        Description=f"Core IAM role {role_name} for ZT-SRE autonomous incident response",
-                    )
-                    roles_mutated = True
-                    remediated.append(f"Created missing IAM role '{role_name}' with valid trust policy")
-                    return True
-                except Exception as create_exc:
-                    print(f"  ⚠️ Warning: Failed creating {role_name}: {create_exc}")
-                    return False
+                max_attempts = 4
+                for attempt in range(max_attempts):
+                    try:
+                        iam.create_role(
+                            RoleName=role_name,
+                            AssumeRolePolicyDocument=json.dumps(trust_doc),
+                            Description=f"Core IAM role {role_name} for ZT-SRE autonomous incident response",
+                        )
+                        roles_mutated = True
+                        remediated.append(f"Created missing IAM role '{role_name}' with valid trust policy")
+                        return True
+                    except ClientError as create_err:
+                        err_code = create_err.response.get("Error", {}).get("Code", "")
+                        if "MalformedPolicyDocument" in err_code and attempt < max_attempts - 1:
+                            time.sleep(2)
+                            continue
+                        print(f"  ⚠️ Warning: Failed creating {role_name}: {create_err}")
+                        return False
+                    except Exception as create_exc:
+                        print(f"  ⚠️ Warning: Failed creating {role_name}: {create_exc}")
+                        return False
             else:
                 print(f"  ⚠️ Warning: Failed checking {role_name}: {exc}")
                 return False
+        return False
 
     # 1. incidents-agent-role
     agent_role_name = "incidents-agent-role"
@@ -2387,7 +2401,95 @@ def ensure_core_iam_roles(
         except Exception as exc:
             print(f"  ⚠️ Warning: Failed configuring policies on {op_role_name}: {exc}")
 
-    # 6. Propagation Delay for AWS STS eventual consistency
+    # 6. incidents-notifier-role
+    notifier_role_name = "incidents-notifier-role"
+    if _ensure_role_and_trust(notifier_role_name, lambda_trust):
+        try:
+            iam.attach_role_policy(
+                RoleName=notifier_role_name,
+                PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+            )
+            notifier_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": "secretsmanager:GetSecretValue",
+                        "Resource": f"arn:aws:secretsmanager:{reg}:{account_id}:secret:/incidents/*",
+                    },
+                ],
+            }
+            iam.put_role_policy(
+                RoleName=notifier_role_name,
+                PolicyName="incidents-notifier-policy",
+                PolicyDocument=json.dumps(notifier_policy),
+            )
+            remediated.append(f"Reconciled inline policy 'incidents-notifier-policy' on '{notifier_role_name}'")
+        except Exception as exc:
+            print(f"  ⚠️ Warning: Failed configuring policies on {notifier_role_name}: {exc}")
+
+    # 7. incidents-slack-callback-role
+    slack_cb_role_name = "incidents-slack-callback-role"
+    if _ensure_role_and_trust(slack_cb_role_name, lambda_trust):
+        try:
+            iam.attach_role_policy(
+                RoleName=slack_cb_role_name,
+                PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+            )
+            slack_cb_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": "secretsmanager:GetSecretValue",
+                        "Resource": f"arn:aws:secretsmanager:{reg}:{account_id}:secret:/incidents/*",
+                    },
+                    {
+                        "Sid": "EventsTableAppendOnly",
+                        "Effect": "Allow",
+                        "Action": [
+                            "dynamodb:GetItem",
+                            "dynamodb:PutItem",
+                            "dynamodb:UpdateItem",
+                            "dynamodb:Query",
+                            "dynamodb:DescribeTable",
+                        ],
+                        "Resource": f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-events",
+                    },
+                    {
+                        "Sid": "MutableOperationalTables",
+                        "Effect": "Allow",
+                        "Action": [
+                            "dynamodb:GetItem",
+                            "dynamodb:PutItem",
+                            "dynamodb:UpdateItem",
+                            "dynamodb:DeleteItem",
+                            "dynamodb:Query",
+                            "dynamodb:DescribeTable",
+                        ],
+                        "Resource": [
+                            f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-leases",
+                            f"arn:aws:dynamodb:{reg}:{account_id}:table/incidents-dedup",
+                        ],
+                    },
+                    {
+                        "Sid": "InvokeAnyIncidentsMicroLambda",
+                        "Effect": "Allow",
+                        "Action": "lambda:InvokeFunction",
+                        "Resource": f"arn:aws:lambda:{reg}:{account_id}:function:incidents-*",
+                    },
+                ],
+            }
+            iam.put_role_policy(
+                RoleName=slack_cb_role_name,
+                PolicyName="incidents-slack-callback-policy",
+                PolicyDocument=json.dumps(slack_cb_policy),
+            )
+            remediated.append(f"Reconciled inline policy 'incidents-slack-callback-policy' on '{slack_cb_role_name}'")
+        except Exception as exc:
+            print(f"  ⚠️ Warning: Failed configuring policies on {slack_cb_role_name}: {exc}")
+
+    # 8. Propagation Delay for AWS STS eventual consistency
     if roles_mutated:
         effective_delay = 0 if os.environ.get("PYTEST_CURRENT_TEST") else propagation_delay
         if effective_delay > 0:

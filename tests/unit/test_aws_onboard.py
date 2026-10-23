@@ -1693,14 +1693,21 @@ class TestCoreIamRolesReconciliation:
 
         remediated = ensure_core_iam_roles(mock_session, account_id="111122223333", region="us-east-1", propagation_delay=0)
 
-        # 5 roles created
-        assert mock_iam.create_role.call_count == 5
+        # 7 roles created
+        assert mock_iam.create_role.call_count == 7
         created_role_names = [c[1]["RoleName"] for c in mock_iam.create_role.call_args_list]
         assert "incidents-agent-role" in created_role_names
         assert "incidents-observer-role" in created_role_names
         assert "incidents-ingest-role" in created_role_names
         assert "incidents-executor-role" in created_role_names
         assert "RemediationOperatorRole" in created_role_names
+        assert "incidents-notifier-role" in created_role_names
+        assert "incidents-slack-callback-role" in created_role_names
+
+        # Crucial ordering check: incidents-executor-role MUST be created before RemediationOperatorRole
+        executor_idx = created_role_names.index("incidents-executor-role")
+        operator_idx = created_role_names.index("RemediationOperatorRole")
+        assert executor_idx < operator_idx
 
         # Verify lambda.amazonaws.com trust on agent role
         agent_create = [c for c in mock_iam.create_role.call_args_list if c[1]["RoleName"] == "incidents-agent-role"][0]
@@ -1893,6 +1900,35 @@ class TestEnvFileInjection:
         # Omitted
         args_omitted = parse_args(["--mode", "audit"])
         assert args_omitted.env_file == ""
+
+    def test_build_cfn_parameters_sets_create_core_iam_roles_false_on_apply(self):
+        """
+        Verify that in '--mode apply' (is_apply=True), CreateCoreIamRoles is ALWAYS set to 'false'
+        even in a greenfield account where no roles existed prior to apply, because ensure_core_iam_roles
+        handles role creation and trust reconciliation directly in boto3 to prevent CloudFormation
+        ResourceExistenceCheck / EntityAlreadyExists collisions.
+        """
+        ident = _make_identity()
+        ec2 = _make_ec2_report(has_security_tag=False)
+        ddb = _make_dynamodb_report(all_ready=False)
+        s3 = _make_s3_report(exists=False)
+        ssm = _make_ssm_report(all_ready=False)
+        iam = _make_iam_report(all_ready=False)
+        secrets_rep = _make_secrets_report(all_exist=False)
+        stack = _make_stack_report()
+
+        report = AuditReport(
+            identity=ident, ec2=ec2, dynamodb=ddb, s3=s3, ssm=ssm,
+            iam=iam, secrets=secrets_rep, stack=stack, overall_status="NEEDS_PRE_DEPLOY",
+        )
+
+        # Plan mode (is_apply=False)
+        params_plan, _, _ = build_cfn_parameters(report, is_apply=False)
+        assert params_plan["CreateCoreIamRoles"] == "true"
+
+        # Apply mode (is_apply=True) -> MUST be 'false' to defer to ensure_core_iam_roles
+        params_apply, _, _ = build_cfn_parameters(report, is_apply=True)
+        assert params_apply["CreateCoreIamRoles"] == "false"
 
 
 

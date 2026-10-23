@@ -71,7 +71,7 @@ Parameters:
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
-    Description: "Create core IAM roles (incidents-agent-role, incidents-observer-role, RemediationOperatorRole); set false if already created"
+    Description: "Create core IAM roles (incidents-ingest-role, incidents-agent-role, incidents-observer-role, incidents-executor-role, incidents-notifier-role, incidents-slack-callback-role, RemediationOperatorRole); set false if already created"
 
   EnableAlarms:
     Type: String
@@ -304,6 +304,7 @@ Resources:
 
   IngestRole:
     Type: AWS::IAM::Role
+    Condition: ShouldCreateCoreIamRoles
     Properties:
       RoleName: incidents-ingest-role
       AssumeRolePolicyDocument:
@@ -452,6 +453,7 @@ Resources:
 
   ExecutorRole:
     Type: AWS::IAM::Role
+    Condition: ShouldCreateCoreIamRoles
     Properties:
       RoleName: incidents-executor-role
       AssumeRolePolicyDocument:
@@ -538,6 +540,7 @@ Resources:
 
   NotifierRole:
     Type: AWS::IAM::Role
+    Condition: ShouldCreateCoreIamRoles
     Properties:
       RoleName: incidents-notifier-role
       AssumeRolePolicyDocument:
@@ -559,6 +562,7 @@ Resources:
 
   SlackCallbackRole:
     Type: AWS::IAM::Role
+    Condition: ShouldCreateCoreIamRoles
     Properties:
       RoleName: incidents-slack-callback-role
       AssumeRolePolicyDocument:
@@ -609,7 +613,7 @@ Resources:
     Properties:
       FunctionName: incidents-ingest
       Handler: handlers.ingest.handler
-      Role: !GetAtt IngestRole.Arn
+      Role: !If [ShouldCreateCoreIamRoles, !GetAtt IngestRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/incidents-ingest-role"]
       MemorySize: 256
       Timeout: 30
       Events:
@@ -658,7 +662,7 @@ Resources:
     Properties:
       FunctionName: incidents-executor
       Handler: handlers.executor_fn.handler
-      Role: !GetAtt ExecutorRole.Arn
+      Role: !If [ShouldCreateCoreIamRoles, !GetAtt ExecutorRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/incidents-executor-role"]
       MemorySize: 256
       Timeout: 300
       Environment:
@@ -676,7 +680,7 @@ Resources:
     Properties:
       FunctionName: incidents-notifier
       Handler: handlers.notifier.handler
-      Role: !GetAtt NotifierRole.Arn
+      Role: !If [ShouldCreateCoreIamRoles, !GetAtt NotifierRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/incidents-notifier-role"]
       MemorySize: 128
       Timeout: 30
       Environment:
@@ -695,7 +699,7 @@ Resources:
     Properties:
       FunctionName: incidents-slack-callback
       Handler: handlers.slack_callback.handler
-      Role: !GetAtt SlackCallbackRole.Arn
+      Role: !If [ShouldCreateCoreIamRoles, !GetAtt SlackCallbackRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/incidents-slack-callback-role"]
       MemorySize: 128
       Timeout: 10
       FunctionUrlConfig:
