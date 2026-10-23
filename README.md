@@ -1,9 +1,9 @@
 # 🛡️ Autonomous Zero-Trust SecOps Agent for AWS
 
 [![AWS Hackathon](https://img.shields.io/badge/AWS%20Hackathon-Strands%20Decider%202B%20%7C%20Amazon%20Bedrock-orange?style=for-the-badge)](#)
-[![YouTube Demo](https://img.shields.io/badge/YouTube%20Demo-Live%20Remediation-red?style=for-the-badge&logo=youtube)](https://www.youtube.com/watch?v=572k45RA4yo)
+[![YouTube Demo](https://img.shields.io/badge/YouTube%20Demo-Live%20Remediation-red?style=for-the-badge&logo=youtube)](https://youtu.be/aHZh-q39Zik?si=u7Z483rJQfceuCBe)
 [![Pattern Tags](https://img.shields.io/badge/Pattern%20Tags-%23strands--decider--2b%20%7C%20%23tool--selection-blue?style=for-the-badge)](#-mandatory-hackathon-tags)
-[![Pytest Suite](https://img.shields.io/badge/pytest-546%20passed%20(100%25)-brightgreen?style=for-the-badge&logo=pytest)](tests/README.md)
+[![Pytest Suite](https://img.shields.io/badge/pytest-562%20passed%20(100%25)-brightgreen?style=for-the-badge&logo=pytest)](tests/README.md)
 [![License](https://img.shields.io/badge/License-Apache--2.0-green?style=for-the-badge)](LICENSE)
 [![Zero Runbooks](https://img.shields.io/badge/Zero--Runbooks-100%25%20Dynamic%20Reasoning-blue?style=for-the-badge)](tests/test_no_runbooks.py)
 [![Security Invariants](https://img.shields.io/badge/Security%20Invariants-16%20Enforced%20(I--01..I--16)-red?style=for-the-badge)](src/README.md#4-the-16-security-invariants)
@@ -22,8 +22,8 @@
 > **Continuous, Zero-Cut Autonomous Incident Investigation on Live AWS Infrastructure:**  
 > Watch the autonomous agent discover the outage, reason through root-cause hypotheses, interact with Slack, execute surgical remediation, and verify recovery live on real AWS infrastructure:
 
-[![Autonomous SecOps Agent Live Demo](https://img.youtube.com/vi/572k45RA4yo/hqdefault.jpg)](https://www.youtube.com/watch?v=572k45RA4yo)  
-*▶️ [Click to watch the full demonstration on YouTube](https://www.youtube.com/watch?v=572k45RA4yo)*
+[![Autonomous SecOps Agent Live Demo](https://img.youtube.com/vi/aHZh-q39Zik/hqdefault.jpg)](https://youtu.be/aHZh-q39Zik?si=u7Z483rJQfceuCBe)  
+*▶️ [Click to watch the full demonstration on YouTube](https://youtu.be/aHZh-q39Zik?si=u7Z483rJQfceuCBe)*
 
 ---
 
