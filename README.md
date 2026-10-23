@@ -3,7 +3,7 @@
 [![AWS Hackathon](https://img.shields.io/badge/AWS%20Hackathon-Strands%20Decider%202B%20%7C%20Amazon%20Bedrock-orange?style=for-the-badge)](#)
 [![YouTube Demo](https://img.shields.io/badge/YouTube%20Demo-Live%20Remediation-red?style=for-the-badge&logo=youtube)](https://www.youtube.com/watch?v=572k45RA4yo)
 [![Pattern Tags](https://img.shields.io/badge/Pattern%20Tags-%23strands--decider--2b%20%7C%20%23tool--selection-blue?style=for-the-badge)](#-mandatory-hackathon-tags)
-[![Pytest Suite](https://img.shields.io/badge/pytest-541%20passed%20(100%25)-brightgreen?style=for-the-badge&logo=pytest)](tests/README.md)
+[![Pytest Suite](https://img.shields.io/badge/pytest-544%20passed%20(100%25)-brightgreen?style=for-the-badge&logo=pytest)](tests/README.md)
 [![License](https://img.shields.io/badge/License-Apache--2.0-green?style=for-the-badge)](LICENSE)
 [![Zero Runbooks](https://img.shields.io/badge/Zero--Runbooks-100%25%20Dynamic%20Reasoning-blue?style=for-the-badge)](tests/test_no_runbooks.py)
 [![Security Invariants](https://img.shields.io/badge/Security%20Invariants-16%20Enforced%20(I--01..I--16)-red?style=for-the-badge)](src/README.md#4-the-16-security-invariants)
@@ -80,7 +80,7 @@ This repository is strictly structured into modular, self-documenting subsystems
 | **Infrastructure as Code** | [`infra/README.md`](infra/README.md) | AWS SAM `template.yaml`, Zero-Trust SSM Documents (`incidents-observe-readonly`, `incidents-repair-restricted`), conditional provisioning, and SCP-immune architecture. |
 | **Onboarding & Delta CLI** | [`scripts/README.md`](scripts/README.md) | 7-Layer Deep Discovery Engine (`aws_onboard.py`), Greenfield vs Brownfield Delta Planning, IAM propagation retry backoff, dead-stack self-healing, and CFN failure forensic extraction. |
 | **Universal Live Investigation** | [`demos/README.md`](demos/README.md) | Zero-scripted dynamic incident investigation (`run_live_incident.py`), auto-discovery via `IncidentsAgent=true`, and Slack Socket Mode interactive approval. |
-| **Verification & Tests** | [`tests/README.md`](tests/README.md) | **541 automated tests** (100% pass rate), cross-backend storage conformance (`DynamoDB`, `SQLite`, `InMemory`), defensive shell injection hardening, and E2E simulation. |
+| **Verification & Tests** | [`tests/README.md`](tests/README.md) | **544 automated tests** (100% pass rate), cross-backend storage conformance (`DynamoDB`, `SQLite`, `InMemory`), defensive shell injection hardening, and E2E simulation. |
 
 ---
 
@@ -181,11 +181,33 @@ Every proposed action is intercepted by an independent, deterministic [`PolicyGa
 * Under Slack Interactive Socket Mode, human operators have an explicit window (`SLACK_APPROVAL_TIMEOUT=300` seconds / 5 minutes) to authorize high-risk T2 actions.
 * If the engineer is away or the request expires: **The system halts safely in a Fail-Closed posture**. It appends an `EventType.Escalated` event to DynamoDB and leaves the infrastructure untouched.
 
+### 4. Universal Autonomous Sentinel & 5-Alarm Production Suite (IaC)
+The system eliminates brittle distro-specific or application-specific monitoring via a universal 5-alarm CloudWatch suite defined in `template.yaml` (821 lines of AWS SAM):
+* **`High-CPU` (AWS/EC2)**: CPUUtilization > 85% (catches infinite loops & runaway processes across ANY OS).
+* **`StatusCheckFailed` (AWS/EC2)**: Hypervisor & OS deadlock detection from AWS infrastructure directly.
+* **`High-Disk` (CWAgent)**: Root filesystem consumption > 85% with unified `"aggregation_dimensions": [["InstanceId"]]` to eliminate device name fragmentation (`nvme` vs `xvda`).
+* **`High-Memory` (CWAgent)**: Physical RAM pressure > 85% to mitigate OOM kills before system crash.
+* **`System-Degraded` (CWAgent)**: Generic service failure alarm driven by a native **Linux Systemd Timer** (`cwsys_health.timer`) running every 60s via IMDSv2. Detects both abnormal process crashes (`systemctl --failed`) AND stopped enabled critical services (`! is-active`) with zero `cron`/`cronie` dependency across Ubuntu, Debian, AL2023, and RHEL.
+
+### 5. Omni-Ingestion Sentinel Layer (`handlers/ingest.py`)
+`incidents-ingest` operates as a decoupled, multi-source ingestion sentinel:
+* Parses CloudWatch alarm state transitions via EventBridge with zero reliance on alarm naming conventions.
+* Extracts the target instance directly from `configuration.metrics[*].metricStat.metric.dimensions`, allowing custom enterprise alarms (`Prod-API-Down`, `Payment-Gateway-Failure`) to seamlessly route to the autonomous agent.
+
 ---
 
 ## 🧪 Quickstart: Running the Agent & Tests
 
-### 1. Running the Automated Test Suite (541 Tests - 100% Pass Rate)
+### 1. 1-Click Reproducible Deployment via AWS SAM
+Deploy the complete production stack (6 Serverless Lambdas, 3 DynamoDB Tables, 5 CloudWatch Alarms, and Least-Privilege IAM Boundaries) into any AWS account within two minutes:
+```bash
+sam build
+sam deploy --guided
+```
+
+---
+
+### 2. Running the Automated Test Suite (544 Tests - 100% Pass Rate)
 Install dependencies and run the complete test suite:
 ```bash
 pip install -r requirements-dev.txt
@@ -202,11 +224,14 @@ python3 -m pytest tests/agent/ -v
 
 # Verify Storage Conformance across DynamoDB, SQLite & Memory (52 tests)
 python3 -m pytest tests/conformance/ -v
+
+# Verify Serverless Handlers & Ingest Dimensions (61 tests)
+python3 -m pytest tests/handlers/ -v
 ```
 
 ---
 
-### 2. Running Live Autonomous Incident Remediation (`demos/run_live_incident.py`)
+### 3. Running Live Autonomous Incident Remediation (`demos/run_live_incident.py`)
 Run a live, end-to-end autonomous investigation on any tagged EC2 host (`IncidentsAgent=true`):
 ```bash
 python3 -u demos/run_live_incident.py "CloudWatch-ALB-5XX-Spike: Order gateway upstream routing failure detected on instance"

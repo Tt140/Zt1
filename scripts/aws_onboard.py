@@ -1163,10 +1163,15 @@ def _ensure_ssm_instance_profile_exists(
         except Exception:
             pass
 
-    try:
-        iam.attach_role_policy(RoleName=role_name, PolicyArn=ssm_policy_arn)
-    except Exception:
-        pass
+    policies_to_attach = [
+        "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+        "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy",
+    ]
+    for pol_arn in policies_to_attach:
+        try:
+            iam.attach_role_policy(RoleName=role_name, PolicyArn=pol_arn)
+        except Exception:
+            pass
 
     try:
         iam.get_instance_profile(InstanceProfileName=profile_name)
@@ -1339,10 +1344,114 @@ def provision_dedicated_target_vps(
     except Exception:
         instance_type = "t3.micro"
 
-    # 4. UserData script: install & enable Nginx
-    user_data = """#!/bin/bash
-dnf install -y nginx
-systemctl enable --now nginx
+    # 4. UserData script: install & enable Nginx, CloudWatch Agent, and Universal Systemd Health Timer
+    user_data = r"""#!/bin/bash
+set -e
+
+# 1. Package manager detection and universal package installation
+if command -v dnf >/dev/null 2>&1; then
+    dnf install -y nginx amazon-cloudwatch-agent curl
+elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y && apt-get install -y nginx amazon-cloudwatch-agent curl
+elif command -v yum >/dev/null 2>&1; then
+    yum install -y nginx amazon-cloudwatch-agent curl
+fi
+
+systemctl enable --now nginx || true
+
+# 2. Configure CloudWatch Agent with unified aggregation dimensions
+mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+cat <<'EOF' > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "run_as_user": "root"
+  },
+  "metrics": {
+    "aggregation_dimensions": [["InstanceId"]],
+    "append_dimensions": {
+      "InstanceId": "${aws:InstanceId}"
+    },
+    "metrics_collected": {
+      "disk": {
+        "measurement": ["disk_used_percent"],
+        "resources": ["/"],
+        "drop_device": true
+      },
+      "mem": {
+        "measurement": ["mem_used_percent"]
+      }
+    }
+  }
+}
+EOF
+
+if [ -f /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]; then
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || true
+fi
+
+# 3. Universal Systemd Health Pulse Script (Both Crash & Stopped Enabled Services)
+mkdir -p /opt/incidents/bin
+cat <<'EOF' > /opt/incidents/bin/system_health_pulse.sh
+#!/bin/bash
+TOKEN=$(curl -s -S -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || true)
+if [ -n "$TOKEN" ]; then
+    INSTANCE_ID=$(curl -s -S -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)
+    REGION=$(curl -s -S -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || true)
+else
+    INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)
+    REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || true)
+fi
+
+[ -z "$REGION" ] && REGION="us-east-1"
+[ -z "$INSTANCE_ID" ] && exit 0
+
+FAILED_COUNT=$(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | grep -E '\.service' | wc -l)
+STOPPED_ENABLED=0
+for s in nginx docker httpd apache2 myapp; do
+    if systemctl is-enabled "$s" >/dev/null 2>&1; then
+        if ! systemctl is-active --quiet "$s"; then
+            STOPPED_ENABLED=$((STOPPED_ENABLED + 1))
+        fi
+    fi
+done
+TOTAL_FAILS=$((FAILED_COUNT + STOPPED_ENABLED))
+
+aws cloudwatch put-metric-data \
+    --namespace "CWAgent" \
+    --metric-name "FailedServicesCount" \
+    --dimensions InstanceId="$INSTANCE_ID" \
+    --value "$TOTAL_FAILS" \
+    --region "$REGION" 2>/dev/null || true
+EOF
+chmod +x /opt/incidents/bin/system_health_pulse.sh
+
+# 4. Native Systemd Timer (100% universal across Ubuntu, Debian, AL2023, RHEL - no cron package needed)
+cat <<'EOF' > /etc/systemd/system/cwsys_health.service
+[Unit]
+Description=Universal CloudWatch System Health Metric Reporter
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/incidents/bin/system_health_pulse.sh
+EOF
+
+cat <<'EOF' > /etc/systemd/system/cwsys_health.timer
+[Unit]
+Description=Run Universal CloudWatch System Health Metric Reporter every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now cwsys_health.timer || true
 """
 
     run_kwargs = {

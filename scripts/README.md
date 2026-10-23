@@ -87,12 +87,16 @@ Designed for enterprise clients integrating the agent into an existing environme
 ### Option B: Greenfield Isolated Environment via `-T` (Zero-Touch Dedicated)
 Designed for rapid proof-of-concept testing, training, or isolated sandboxing:
 * Passing `-T` or `--create-target-vps` provisions a completely isolated, standalone environment:
-  1. Creates an Amazon Linux 2023 EC2 instance (`t3.micro` / `t4g.micro`).
-  2. Creates and attaches `IncidentsTargetSSMInstanceProfile` (AmazonSSMManagedInstanceCore).
-  3. Installs and enables the `nginx` web server on port 80.
-  4. Automatically tags the instance with `IncidentsAgent=true`.
-  5. Waits for SSM Fleet Manager to report the instance status as `Online`.
-  6. Directs CloudFormation to create a brand-new dedicated S3 blobs bucket (`CreateBlobsBucket=true`).
+  1. Creates an EC2 instance (`t3.micro` / `t4g.micro`) with automated multi-distro package manager detection (`dnf`, `apt-get`, `yum`).
+  2. Creates and attaches `IncidentsTargetSSMInstanceProfile` with dual least-privilege IAM policies:
+     * `AmazonSSMManagedInstanceCore` (Zero-Trust SSM execution & observation).
+     * `CloudWatchAgentServerPolicy` (CloudWatch Agent and `put-metric-data` telemetry ingestion).
+  3. Installs and enables the `nginx` web server as a sample production workload.
+  4. Automatically configures and launches `amazon-cloudwatch-agent` with unified `"aggregation_dimensions": [["InstanceId"]]` to eliminate EBS/NVMe disk device name fragmentation (`nvme` vs `xvda`).
+  5. Deploys the **Universal Native Systemd Health Pulse** (`cwsys_health.service` & `cwsys_health.timer`), running every 60 seconds with zero `cron`/`cronie` dependency across Ubuntu, Debian, AL2023, and RHEL.
+  6. Automatically tags the instance with `IncidentsAgent=true`.
+  7. Waits for SSM Fleet Manager to report the instance status as `Online`.
+  8. Directs CloudFormation to create a dedicated S3 blobs bucket (`CreateBlobsBucket=true`) and automatically enables all 5 CloudWatch alarms (`EnableAlarms=true`, `EnableDiskAlarm=true`).
 
 ---
 
@@ -114,6 +118,12 @@ When `sam deploy` fails, standard tooling frequently outputs generic errors like
 
 ### 4. Strict `.env` Isolation & Placeholder Detection
 The CLI inspects environment configurations and AWS Secrets Manager for unpopulated placeholder values (e.g. `YOUR_KEY_HERE`, `placeholder`). It flags unconfigured Slack webhooks or LLM tokens transparently and outputs a sanitized `.env.onboarded` file with zero secrets leaked.
+
+### 5. Universal Native Systemd Health Pulse (Crash & Clean Stop Dual Detection)
+Traditional monitoring scripts either fail on distributions lacking `cronie` (such as Amazon Linux 2023) or only detect abnormal crashes via `systemctl --failed` while ignoring manual or administrative service stops (`systemctl stop`).
+* **Remediation**: `aws_onboard.py` deploys a native Linux Systemd Timer (`cwsys_health.timer`) running every 60 seconds with IMDSv2 token security. It calculates:
+  $$\text{Failed Services} = \text{failed units count} + \text{enabled but inactive critical daemons count}$$
+  This emits `FailedServicesCount` directly to the `CWAgent` CloudWatch namespace, guaranteeing that both unhandled application crashes and stopped services trigger an immediate `ALARM` state within 60 seconds.
 
 ---
 

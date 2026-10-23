@@ -770,6 +770,42 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
+  HighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateDiskAlarm
+    Properties:
+      AlarmName: !Sub "High-Memory-${TargetInstanceId}"
+      AlarmDescription: "Triggers autonomous agent investigation when physical memory usage exceeds 85%"
+      Namespace: CWAgent
+      MetricName: mem_used_percent
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref TargetInstanceId
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  SystemDegradedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateDiskAlarm
+    Properties:
+      AlarmName: !Sub "System-Degraded-${TargetInstanceId}"
+      AlarmDescription: "Triggers autonomous agent investigation when any systemd service fails or crashes"
+      Namespace: CWAgent
+      MetricName: FailedServicesCount
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref TargetInstanceId
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
 # ── Outputs ───────────────────────────────────────────────────────────────────
 
 Outputs:

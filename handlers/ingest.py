@@ -46,17 +46,77 @@ logger = logging.getLogger(__name__)
 # The agent function — invoked asynchronously after incident creation
 AGENT_FN = os.environ.get("AGENT_FUNCTION", "incidents-agent")
 
+from typing import Any
+
 # Extract instance_id from alarm name (e.g., DiskUsage-High-i-12345678)
 _INSTANCE_PATTERN = re.compile(r"(i-[0-9a-f]{8,17})", re.IGNORECASE)
 
 
-def _extract_instance_id(alarm_name: str, description: str = "") -> str:
-    """Extracts instance_id from alarm name or configuration description."""
+def _find_instance_in_dimensions(dims: Any) -> str | None:
+    """Inspects a dimensions collection (dict or list of name/value dicts) for an instance ID."""
+    if not dims:
+        return None
+    if isinstance(dims, dict):
+        for k, v in dims.items():
+            if str(k).lower() in ("instanceid", "instance_id", "targetinstanceid"):
+                m = _INSTANCE_PATTERN.search(str(v))
+                if m:
+                    return m.group(1)
+            elif _INSTANCE_PATTERN.search(str(v)):
+                return _INSTANCE_PATTERN.search(str(v)).group(1)
+    elif isinstance(dims, list):
+        for item in dims:
+            if isinstance(item, dict):
+                name = str(item.get("name") or item.get("Name") or "").lower()
+                val = str(item.get("value") or item.get("Value") or "")
+                if name in ("instanceid", "instance_id", "targetinstanceid"):
+                    m = _INSTANCE_PATTERN.search(val)
+                    if m:
+                        return m.group(1)
+                elif _INSTANCE_PATTERN.search(val):
+                    return _INSTANCE_PATTERN.search(val).group(1)
+    return None
+
+
+def _extract_instance_id(alarm_name: str, description: str = "", detail: dict | None = None) -> str:
+    """
+    Extracts instance_id using a multi-layer strategy:
+      1. CloudWatch Metric Dimensions (configuration.metrics[*].metricStat.metric.dimensions or direct dimensions)
+      2. Alarm name pattern matching (i-[0-9a-f]{8,17})
+      3. Description pattern matching
+      4. Fallback environment variables (TARGET_INSTANCE_ID / INSTANCE_ID)
+    """
+    # 1. Check detail configuration dimensions if provided
+    if detail and isinstance(detail, dict):
+        config = detail.get("configuration", {}) or {}
+
+        # Check configuration.metrics (standard metricStat format)
+        metrics = config.get("metrics") or []
+        for m_entry in metrics:
+            if not isinstance(m_entry, dict):
+                continue
+            metric_stat = m_entry.get("metricStat", {}) or {}
+            metric = metric_stat.get("metric", {}) or {}
+            dims = metric.get("dimensions", {})
+            found = _find_instance_in_dimensions(dims)
+            if found:
+                return found
+
+        # Check direct dimensions in configuration or detail
+        for source_dict in [config, detail]:
+            dims = source_dict.get("dimensions")
+            found = _find_instance_in_dimensions(dims)
+            if found:
+                return found
+
+    # 2. Check alarm_name and description via regex
     for text in [alarm_name, description]:
-        m = _INSTANCE_PATTERN.search(text)
-        if m:
-            return m.group(1)
-    # fallback: env var when agent operates on a single dedicated instance
+        if text:
+            m = _INSTANCE_PATTERN.search(text)
+            if m:
+                return m.group(1)
+
+    # 3. Fallback: env var when agent operates on a single dedicated instance
     return os.environ.get("TARGET_INSTANCE_ID") or os.environ.get("INSTANCE_ID") or "i-unknown"
 
 
@@ -82,7 +142,7 @@ def handler(event: dict, context) -> dict:
             logger.info(f"Skipping alarm state {alarm_state!r} for {alarm_name}")
             return ok({"skipped": True, "reason": "not ALARM state"})
 
-        instance_id = _extract_instance_id(alarm_name, description)
+        instance_id = _extract_instance_id(alarm_name, description, detail=detail)
         dedupe_key  = f"alarm::{alarm_name}::{instance_id}"
         incident_id = new_ulid()
 

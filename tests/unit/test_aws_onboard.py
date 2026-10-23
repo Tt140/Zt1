@@ -805,9 +805,13 @@ class TestAwsOnboardPlanner:
         assert success is True
         mock_iam.create_role.assert_called_once()
         assert mock_iam.create_role.call_args[1]["RoleName"] == "IncidentsTargetSSMInstanceRole"
-        mock_iam.attach_role_policy.assert_called_once_with(
+        mock_iam.attach_role_policy.assert_any_call(
             RoleName="IncidentsTargetSSMInstanceRole",
             PolicyArn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+        )
+        mock_iam.attach_role_policy.assert_any_call(
+            RoleName="IncidentsTargetSSMInstanceRole",
+            PolicyArn="arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy",
         )
         mock_iam.create_instance_profile.assert_called_once_with(
             InstanceProfileName="IncidentsTargetSSMInstanceProfile"

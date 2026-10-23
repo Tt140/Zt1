@@ -156,3 +156,84 @@ class TestIngestAlarmNameParsing:
         result = _extract_instance_id("no-instance-here", "")
         # Returns i-unknown or env var
         assert result in ("i-unknown",) or result.startswith("i-")
+
+    def test_extracts_from_configuration_metrics_dimensions_dict(self):
+        from handlers.ingest import _extract_instance_id
+        detail = {
+            "configuration": {
+                "metrics": [
+                    {
+                        "metricStat": {
+                            "metric": {
+                                "dimensions": {
+                                    "InstanceId": "i-0987654321fedcba"
+                                }
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+        result = _extract_instance_id("Production-Web-Down", "Critical outage", detail=detail)
+        assert result == "i-0987654321fedcba"
+
+    def test_extracts_from_dimensions_list_format(self):
+        from handlers.ingest import _extract_instance_id
+        detail = {
+            "configuration": {
+                "metrics": [
+                    {
+                        "metricStat": {
+                            "metric": {
+                                "dimensions": [
+                                    {"name": "InstanceId", "value": "i-1122334455667788"}
+                                ]
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+        result = _extract_instance_id("Database-Memory-High", "", detail=detail)
+        assert result == "i-1122334455667788"
+
+    def test_handler_uses_dimension_extraction_end_to_end(self):
+        from handlers import ingest as mod
+        from src.store.memory import MemoryEventStore
+        from unittest.mock import patch
+        import json
+
+        store = MemoryEventStore()
+        event = {
+            "detail-type": "CloudWatch Alarm State Change",
+            "resources": ["arn:aws:cloudwatch:us-east-1:123:alarm:Generic-Alarm"],
+            "region": "us-east-1",
+            "detail": {
+                "alarmName": "Universal-Docker-Down",
+                "state": {"value": "ALARM"},
+                "configuration": {
+                    "description": "Any workload crash",
+                    "metrics": [
+                        {
+                            "metricStat": {
+                                "metric": {
+                                    "dimensions": {
+                                        "InstanceId": "i-0a1b2c3d4e5f6789"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+        with patch.object(mod, "get_store", return_value=store), \
+             patch.object(mod, "invoke_async") as mock_inv:
+            resp = mod.handler(event, context=None)
+
+        assert resp["statusCode"] == 200
+        iid = json.loads(resp["body"])["incident_id"]
+        header = store._headers[iid]
+        assert header.instance_id == "i-0a1b2c3d4e5f6789"
+        mock_inv.assert_called_once()
+        assert mock_inv.call_args[0][1]["instance_id"] == "i-0a1b2c3d4e5f6789"
