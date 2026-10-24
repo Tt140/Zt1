@@ -182,7 +182,7 @@ Every proposed action is intercepted by an independent, deterministic [`PolicyGa
 * If the engineer is away or the request expires: **The system halts safely in a Fail-Closed posture**. It appends an `EventType.Escalated` event to DynamoDB and leaves the infrastructure untouched.
 
 ### 4. Universal Autonomous Sentinel & 5-Alarm Production Suite (IaC)
-The system eliminates brittle distro-specific or application-specific monitoring via a universal 5-alarm CloudWatch suite defined in `template.yaml` (821 lines of AWS SAM):
+The system eliminates brittle distro-specific or application-specific monitoring via a universal 5-alarm CloudWatch suite defined in `template.yaml` (863 lines of AWS SAM):
 * **`High-CPU` (AWS/EC2)**: CPUUtilization > 85% (catches infinite loops & runaway processes across ANY OS).
 * **`StatusCheckFailed` (AWS/EC2)**: Hypervisor & OS deadlock detection from AWS infrastructure directly.
 * **`High-Disk` (CWAgent)**: Root filesystem consumption > 85% with unified `"aggregation_dimensions": [["InstanceId"]]` to eliminate device name fragmentation (`nvme` vs `xvda`).
@@ -212,7 +212,7 @@ This platform was engineered from first principles to be **100% non-intrusive, w
 | **Disk Device Fragmentation** | Alarms break across instance types (`nvme0n1p1` vs `xvda1`) | **Unified Aggregation Dimensions** (`aggregation_dimensions: [["InstanceId"]]`) |
 | **Alarm Decoupling** | Service degradation suppressed if disk metrics absent | **Fully Decoupled `SystemDegradedAlarm`** evaluating 100% independently |
 | **Regional SCP & IAM Constraints** | Cross-region IAM roles triggering SCP `AccessDenied` | **SCP-Immune BYOK Architecture** with zero cross-region dependencies |
-| **Core IAM Role Gaps & Drift** | Missing roles cause Lambda `AccessDenied` assume errors | **Self-Healing Core IAM Engine** (Auto-creates missing roles, wildcard `incidents-*` invocation, 12s STS propagation delay) |
+| **Core IAM Role Gaps & Collision Drift** | Missing roles cause `AccessDenied`; duplicate CloudFormation `Add` triggers `ResourceExistenceCheck` | **Self-Healing Core IAM & Zero-Collision IaC Engine** (7-role idempotent reconciliation, `CreateCoreIamRoles=false` on apply, SAM `!If` conditional linkage, ordered principal generation, wildcard `incidents-*` invocation, 12s STS propagation delay) |
 
 ---
 
@@ -223,9 +223,9 @@ Adopt an existing production EC2 instance or deploy a dedicated sandboxed enviro
 ```bash
 python3 scripts/aws_onboard.py --mode apply --instance-id <INSTANCE_ID> -E .env --yes
 ```
-* **Strict Security Segregation**: Sensitive credentials (`DEEPSEEK_API_KEY`, `APPROVAL_MAC_KEY_HEX`, Slack tokens) are routed directly and securely into **AWS Secrets Manager** via HTTPS API.
-* **Operational Configuration**: Model identifiers and routing parameters (`DEEPSEEK_FLASH_MODEL`, `DEEPSEEK_BASE_URL`, `STRANDS_URL`, etc.) are passed as SAM parameter overrides to update the Lambda environment.
-* **Self-Healing IAM Layer**: Automatically reconciles all 5 core execution roles with wildcard inter-Lambda permissions and guarantees STS consistency before deployment.
+* **Strict Security Segregation**: Sensitive credentials (`DEEPSEEK_API_KEY`, `APPROVAL_MAC_KEY_HEX`, `SLACK_WEBHOOK_URL`, Slack tokens) are routed directly and securely into **AWS Secrets Manager** via HTTPS API.
+* **Operational Configuration**: Model identifiers and routing parameters (`DEEPSEEK_FLASH_MODEL`, `DEEPSEEK_BASE_URL`, `STRANDS_URL`, `SLACK_CHANNEL`, etc.) are passed as SAM parameter overrides to update the Lambda environment.
+* **Self-Healing IAM Layer**: Automatically reconciles all 7 core execution roles (`agent`, `observer`, `ingest`, `executor`, `notifier`, `slack-callback`, `RemediationOperatorRole`), grants forensic S3 snapshot storage, expands SSM document boundaries to AWS default documents, and sets `CreateCoreIamRoles=false` during apply to guarantee zero CloudFormation name collision errors.
 * **Git Safe**: `template.yaml` remains 100% free of secrets, and `.env` is strictly protected inside `.gitignore`.
 
 ---
@@ -239,7 +239,7 @@ sam deploy --guided
 
 ---
 
-### 3. Running the Automated Test Suite (556 Tests - 100% Pass Rate)
+### 3. Running the Automated Test Suite (562 Tests - 100% Pass Rate)
 Install dependencies and run the complete test suite:
 ```bash
 pip install -r requirements-dev.txt
