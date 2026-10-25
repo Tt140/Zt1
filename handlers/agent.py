@@ -177,7 +177,17 @@ def _run_agent(
             decision = final_state.policy_decisions.get(step_id)
 
             if decision and decision.decision == PolicyDecisionValue.allow:
-                logger.info(f"Step {step_id} allowed (T1) — invoking executor")
+                logger.info(f"Step {step_id} allowed (T1) — notifying and invoking executor")
+                cmd = step.execution_spec.get("command", "") if isinstance(step.execution_spec, dict) else ""
+                invoke_async(NOTIFIER_FN, {
+                    "type": "action_proposed",
+                    "incident_id": incident_id,
+                    "instance_id": final_state.instance_id or instance_id,
+                    "step_id": step_id,
+                    "step_description": cmd or f"Execute {step.kind.value} step",
+                    "command": cmd,
+                    "tier": "T1",
+                })
                 invoke_async(EXECUTOR_FN, {
                     "incident_id": incident_id,
                     "step_id": step_id,

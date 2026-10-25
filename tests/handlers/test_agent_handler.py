@@ -196,12 +196,18 @@ class TestAgentHandler:
 
         resp, mock_inv = self._run(store, iid, LoopTermination.PROPOSED)
         assert resp["statusCode"] == 200
-        mock_inv.assert_called_once()
-        target_fn, payload = mock_inv.call_args[0]
-        from handlers.shared import EXECUTOR_FN
-        assert target_fn == EXECUTOR_FN
-        assert payload["incident_id"] == iid
-        assert payload["step_id"] == sid
+        assert mock_inv.call_count == 2
+        from handlers.shared import EXECUTOR_FN, NOTIFIER_FN
+        call_0_fn, call_0_payload = mock_inv.call_args_list[0][0]
+        assert call_0_fn == NOTIFIER_FN
+        assert call_0_payload["type"] == "action_proposed"
+        assert call_0_payload["incident_id"] == iid
+        assert call_0_payload["step_id"] == sid
+        assert call_0_payload["command"] == "systemctl restart nginx"
+        call_1_fn, call_1_payload = mock_inv.call_args_list[1][0]
+        assert call_1_fn == EXECUTOR_FN
+        assert call_1_payload["incident_id"] == iid
+        assert call_1_payload["step_id"] == sid
 
     def test_proposed_step_t2_invokes_notifier_approval_request(self):
         store = MemoryEventStore()

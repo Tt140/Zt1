@@ -38,7 +38,7 @@ from src.domain.types import (
 from src.domain.reducer import fold
 from .shared import (
     get_store, invoke_async,
-    EXECUTOR_FN, AWS_REGION, ok, err,
+    EXECUTOR_FN, NOTIFIER_FN, AWS_REGION, ok, err,
 )
 
 logger = logging.getLogger(__name__)
@@ -178,6 +178,15 @@ def handler(event: dict, context) -> dict:
             ),
         )
         store.append(iid, 0, ev)
+
+        # Notify Slack async: Incident opened
+        invoke_async(NOTIFIER_FN, {
+            "type": "incident_opened",
+            "incident_id": iid,
+            "instance_id": instance_id,
+            "alarm_name": alarm_name,
+            "message": f"CloudWatch alarm '{alarm_name}' triggered incident {iid} on instance {instance_id}",
+        })
 
         # Invoke agent async
         invoke_async(AGENT_FN, {

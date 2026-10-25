@@ -69,10 +69,14 @@ class TestIngestHandler:
         assert len(events) == 1
         assert events[0].type == EventType.IncidentOpened
 
-        # agent invoked async
-        mock_inv.assert_called_once()
-        call_kwargs = mock_inv.call_args[0]
-        assert call_kwargs[1]["incident_id"] == iid
+        # notifier and agent invoked async
+        assert mock_inv.call_count == 2
+        invocations = {call[0][0]: call[0][1] for call in mock_inv.call_args_list}
+        assert mod.NOTIFIER_FN in invocations
+        assert invocations[mod.NOTIFIER_FN]["type"] == "incident_opened"
+        assert invocations[mod.NOTIFIER_FN]["incident_id"] == iid
+        assert mod.AGENT_FN in invocations
+        assert invocations[mod.AGENT_FN]["incident_id"] == iid
 
     def test_deduplication_returns_existing(self):
         store = MemoryEventStore()
@@ -131,8 +135,9 @@ class TestIngestHandler:
             resp = mod.handler(_alarm_event("Test-i-0abc1234"), context=None)
 
         iid = json.loads(resp["body"])["incident_id"]
-        mock_inv.assert_called_once()
-        payload = mock_inv.call_args[0][1]
+        assert mock_inv.call_count == 2
+        agent_call = next(call for call in mock_inv.call_args_list if call[0][0] == mod.AGENT_FN)
+        payload = agent_call[0][1]
         assert payload["incident_id"] == iid
         assert "instance_id" in payload
 
@@ -235,5 +240,6 @@ class TestIngestAlarmNameParsing:
         iid = json.loads(resp["body"])["incident_id"]
         header = store._headers[iid]
         assert header.instance_id == "i-0a1b2c3d4e5f6789"
-        mock_inv.assert_called_once()
-        assert mock_inv.call_args[0][1]["instance_id"] == "i-0a1b2c3d4e5f6789"
+        assert mock_inv.call_count == 2
+        agent_call = next(call for call in mock_inv.call_args_list if call[0][0] == mod.AGENT_FN)
+        assert agent_call[0][1]["instance_id"] == "i-0a1b2c3d4e5f6789"
