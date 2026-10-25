@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch, mock_open
 
 import pytest
 import yaml
+from botocore.exceptions import ClientError
 
 from scripts.aws_onboard import (
     AuditReport,
@@ -1976,6 +1977,89 @@ class TestEnvFileInjection:
         # Apply mode (is_apply=True) -> MUST be 'false' to defer to ensure_core_iam_roles
         params_apply, _, _ = build_cfn_parameters(report, is_apply=True)
         assert params_apply["CreateCoreIamRoles"] == "false"
+        assert params_apply["CreateSsmDocuments"] == "false"
+
+
+class TestSsmDocumentsReconciliation:
+    """Unit tests for ensure_ssm_documents bootstrap and drift reconciliation."""
+
+    def test_ensure_ssm_documents_creates_missing_documents(self, tmp_path):
+        from scripts.aws_onboard import ensure_ssm_documents
+
+        mock_root = tmp_path / "proj"
+        mock_ssm_dir = mock_root / "infra" / "ssm"
+        mock_ssm_dir.mkdir(parents=True)
+        (mock_ssm_dir / "incidents-observe-readonly.json").write_text(
+            json.dumps({"parameters": {"command": {"allowedPattern": "pattern1"}}})
+        )
+        (mock_ssm_dir / "incidents-repair-restricted.json").write_text(
+            json.dumps({"parameters": {"command": {"allowedPattern": "pattern2"}}})
+        )
+
+        mock_session = MagicMock()
+        mock_ssm = MagicMock()
+        mock_session.client.return_value = mock_ssm
+        mock_ssm.describe_document.side_effect = ClientError(
+            {"Error": {"Code": "InvalidDocument", "Message": "Not found"}},
+            "DescribeDocument",
+        )
+
+        remediated = ensure_ssm_documents(mock_session, "us-east-1", str(mock_root))
+        assert len(remediated) == 2
+        assert any("incidents-observe-readonly" in r for r in remediated)
+        assert any("incidents-repair-restricted" in r for r in remediated)
+        assert mock_ssm.create_document.call_count == 2
+
+    def test_ensure_ssm_documents_reconciles_drift(self, tmp_path):
+        from scripts.aws_onboard import ensure_ssm_documents
+
+        mock_root = tmp_path / "proj"
+        mock_ssm_dir = mock_root / "infra" / "ssm"
+        mock_ssm_dir.mkdir(parents=True)
+        (mock_ssm_dir / "incidents-observe-readonly.json").write_text(
+            json.dumps({"parameters": {"command": {"allowedPattern": "expected_pattern"}}})
+        )
+
+        mock_session = MagicMock()
+        mock_ssm = MagicMock()
+        mock_session.client.return_value = mock_ssm
+        mock_ssm.describe_document.return_value = {"Document": {"DefaultVersion": "1"}}
+        mock_ssm.get_document.return_value = {
+            "Content": json.dumps({"parameters": {"command": {"allowedPattern": "drifted_pattern"}}})
+        }
+        mock_ssm.update_document.return_value = {"DocumentDescription": {"DocumentVersion": "2"}}
+
+        remediated = ensure_ssm_documents(mock_session, "us-east-1", str(mock_root))
+        assert len(remediated) == 1
+        assert "Updated SSM Document 'incidents-observe-readonly'" in remediated[0]
+        mock_ssm.update_document.assert_called_once()
+        mock_ssm.update_document_default_version.assert_called_once_with(
+            Name="incidents-observe-readonly", DocumentVersion="2"
+        )
+
+    def test_ensure_ssm_documents_skips_when_matching(self, tmp_path):
+        from scripts.aws_onboard import ensure_ssm_documents
+
+        mock_root = tmp_path / "proj"
+        mock_ssm_dir = mock_root / "infra" / "ssm"
+        mock_ssm_dir.mkdir(parents=True)
+        (mock_ssm_dir / "incidents-observe-readonly.json").write_text(
+            json.dumps({"parameters": {"command": {"allowedPattern": "matching_pattern"}}})
+        )
+
+        mock_session = MagicMock()
+        mock_ssm = MagicMock()
+        mock_session.client.return_value = mock_ssm
+        mock_ssm.describe_document.return_value = {"Document": {"DefaultVersion": "1"}}
+        mock_ssm.get_document.return_value = {
+            "Content": json.dumps({"parameters": {"command": {"allowedPattern": "matching_pattern"}}})
+        }
+
+        remediated = ensure_ssm_documents(mock_session, "us-east-1", str(mock_root))
+        assert len(remediated) == 0
+        mock_ssm.create_document.assert_not_called()
+        mock_ssm.update_document.assert_not_called()
+
 
 
 

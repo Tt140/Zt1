@@ -1009,7 +1009,12 @@ def build_cfn_parameters(
         params["ExistingBlobsBucketName"] = ""
 
     # 6. SSM Documents & Drift check
-    if report.ssm.has_drift:
+    if is_apply:
+        # In apply mode, ensure_ssm_documents idempotently creates and reconciles
+        # all Zero-Trust SSM documents upfront via boto3 before SAM deployment,
+        # completely avoiding CloudFormation DocumentAlreadyExists collisions.
+        params["CreateSsmDocuments"] = "false"
+    elif report.ssm.has_drift:
         params["CreateSsmDocuments"] = "false"
         for dname, dinfo in report.ssm.documents.items():
             if dinfo.drift_detected:
@@ -2518,6 +2523,115 @@ def ensure_core_iam_roles(
     return remediated
 
 
+# ── Zero-Trust SSM Documents Bootstrap & Reconciliation ───────────────────────
+
+def ensure_ssm_documents(
+    session: boto3.Session,
+    region: str,
+    project_root: str,
+    report: Optional[AuditReport] = None,
+) -> List[str]:
+    """
+    Idempotently discovers, creates, and reconciles Zero-Trust SSM documents directly
+    via boto3 before SAM deployment.
+
+    Guarantees:
+    1. Both 'incidents-observe-readonly' and 'incidents-repair-restricted' exist.
+    2. Missing documents are created from infra/ssm/*.json (DocumentType='Command', DocumentFormat='JSON').
+    3. Existing documents with drift are updated to $LATEST and set to $DEFAULT.
+    4. CloudFormation will not face DocumentAlreadyExists collisions or InvalidDocument runtime errors.
+    """
+    remediated: List[str] = []
+    ssm = session.client("ssm", region_name=region)
+
+    doc_files = {
+        "incidents-observe-readonly": os.path.join(project_root, "infra", "ssm", "incidents-observe-readonly.json"),
+        "incidents-repair-restricted": os.path.join(project_root, "infra", "ssm", "incidents-repair-restricted.json"),
+    }
+
+    for doc_name, ref_path in doc_files.items():
+        if not os.path.exists(ref_path):
+            continue
+
+        try:
+            with open(ref_path, "r", encoding="utf-8") as f:
+                ref_content = f.read()
+            ref_json = json.loads(ref_content)
+            expected_pattern = ref_json.get("parameters", {}).get("command", {}).get("allowedPattern", "")
+        except Exception as exc:
+            print(f"  ⚠️ Warning: Failed reading reference SSM document '{ref_path}': {exc}")
+            continue
+
+        # Check existence and drift
+        try:
+            desc = ssm.describe_document(Name=doc_name)
+            content_res = ssm.get_document(Name=doc_name)
+            raw_content = content_res.get("Content", "{}") if isinstance(content_res, dict) else "{}"
+            content_json = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
+            actual_pattern = content_json.get("parameters", {}).get("command", {}).get("allowedPattern", "") if isinstance(content_json, dict) else ""
+
+            drift = (actual_pattern != expected_pattern) if expected_pattern else False
+            if drift:
+                upd = ssm.update_document(
+                    Name=doc_name,
+                    Content=ref_content,
+                    DocumentVersion="$LATEST",
+                )
+                new_ver = upd.get("DocumentDescription", {}).get("DocumentVersion", "$LATEST")
+                ssm.update_document_default_version(Name=doc_name, DocumentVersion=new_ver)
+                remediated.append(
+                    f"Updated SSM Document '{doc_name}' to version {new_ver} matching infra/ssm/{doc_name}.json ($DEFAULT updated)"
+                )
+                if report and hasattr(report, "ssm") and hasattr(report.ssm, "documents") and doc_name in report.ssm.documents:
+                    d = report.ssm.documents[doc_name]
+                    d.exists = True
+                    d.drift_detected = False
+                    d.default_version = new_ver
+        except ClientError as e:
+            err_code = e.response.get("Error", {}).get("Code", "")
+            if err_code in ("InvalidDocument", "DoesNotExistException"):
+                try:
+                    ssm.create_document(
+                        Name=doc_name,
+                        Content=ref_content,
+                        DocumentType="Command",
+                        DocumentFormat="JSON",
+                        Tags=[{"Key": "ManagedBy", "Value": "AutonomousSecOpsAgent"}],
+                    )
+                    remediated.append(f"Created Zero-Trust SSM Document '{doc_name}' from infra/ssm/{doc_name}.json")
+                    if report and hasattr(report, "ssm") and hasattr(report.ssm, "documents") and doc_name in report.ssm.documents:
+                        d = report.ssm.documents[doc_name]
+                        d.exists = True
+                        d.drift_detected = False
+                except ClientError as tag_err:
+                    if "Tag" in str(tag_err) or "Parameter" in str(tag_err):
+                        ssm.create_document(
+                            Name=doc_name,
+                            Content=ref_content,
+                            DocumentType="Command",
+                            DocumentFormat="JSON",
+                        )
+                        remediated.append(f"Created Zero-Trust SSM Document '{doc_name}' from infra/ssm/{doc_name}.json")
+                        if report and hasattr(report, "ssm") and hasattr(report.ssm, "documents") and doc_name in report.ssm.documents:
+                            d = report.ssm.documents[doc_name]
+                            d.exists = True
+                            d.drift_detected = False
+                    else:
+                        print(f"  ⚠️ Warning: Failed creating SSM Document '{doc_name}': {tag_err}")
+                except Exception as create_exc:
+                    print(f"  ⚠️ Warning: Failed creating SSM Document '{doc_name}': {create_exc}")
+            else:
+                print(f"  ⚠️ Warning: Error inspecting SSM Document '{doc_name}': {e}")
+        except Exception as exc:
+            print(f"  ⚠️ Warning: Unexpected error inspecting SSM Document '{doc_name}': {exc}")
+
+    if report and hasattr(report, "ssm"):
+        report.ssm.has_drift = any(d.drift_detected for d in report.ssm.documents.values()) if hasattr(report.ssm, "documents") else False
+        report.ssm.all_ready = not report.ssm.has_drift and (all(d.exists for d in report.ssm.documents.values()) if hasattr(report.ssm, "documents") else True)
+
+    return remediated
+
+
 # ── Pre-Deploy Execution Engine ──────────────────────────────────────────────
 
 def execute_pre_deploy_actions(
@@ -2529,7 +2643,7 @@ def execute_pre_deploy_actions(
     """
     Executes necessary pre-deployment actions safely:
     1. Tag target EC2 instance with IncidentsAgent=true if missing.
-    2. Update SSM Documents if drift is detected.
+    2. Ensure Zero-Trust SSM Documents exist and remediate drift.
     3. Generate cryptographic signing key and create /incidents/approval-mac-key secret if missing.
     """
     executed: List[str] = []
@@ -2552,30 +2666,16 @@ def execute_pre_deploy_actions(
         except Exception as e:
             executed.append(f"Failed to tag EC2 instance '{report.ec2.target_instance.instance_id}': {e}")
 
-    # 2. Fix SSM Document drift
-    if report.ssm.has_drift:
-        ssm = session.client("ssm", region_name=region)
-        for doc_name, dinfo in report.ssm.documents.items():
-            if dinfo.drift_detected:
-                ref_path = os.path.join(project_root, "infra", "ssm", f"{doc_name}.json")
-                if os.path.exists(ref_path):
-                    try:
-                        with open(ref_path, "r", encoding="utf-8") as f:
-                            ref_content = f.read()
-                        upd = ssm.update_document(
-                            Name=doc_name,
-                            Content=ref_content,
-                            DocumentVersion="$LATEST",
-                        )
-                        new_ver = upd.get("DocumentDescription", {}).get("DocumentVersion", "$LATEST")
-                        ssm.update_document_default_version(Name=doc_name, DocumentVersion=new_ver)
-                        executed.append(f"Updated SSM Document '{doc_name}' to version {new_ver} matching infra/ssm/{doc_name}.json ($DEFAULT updated)")
-                        dinfo.drift_detected = False
-                        dinfo.default_version = new_ver
-                    except Exception as e:
-                        executed.append(f"Failed to update SSM Document '{doc_name}': {e}")
-        report.ssm.has_drift = any(d.drift_detected for d in report.ssm.documents.values())
-        report.ssm.all_ready = not report.ssm.has_drift and all(d.exists for d in report.ssm.documents.values())
+    # 2. Fix SSM Document drift and ensure documents exist
+    ssm_reconciled = ensure_ssm_documents(
+        session=session,
+        region=region,
+        project_root=project_root,
+        report=report,
+    )
+    for act in ssm_reconciled:
+        if act not in executed:
+            executed.append(act)
 
     # 3. Create missing approval MAC key secret
     mac_key_name = "/incidents/approval-mac-key"
@@ -2803,6 +2903,17 @@ def run_apply_mode(
     for act in iam_reconciled:
         print(f"  ✓ {act}")
 
+    # 3.5 Bootstrap & Reconcile Zero-Trust SSM Documents (incidents-observe-readonly, incidents-repair-restricted)
+    print("  📄 Reconciling Zero-Trust SSM Documents...")
+    ssm_reconciled = ensure_ssm_documents(
+        session=session,
+        region=region,
+        project_root=project_root,
+        report=report,
+    )
+    for act in ssm_reconciled:
+        print(f"  ✓ {act}")
+
     executed_actions = execute_pre_deploy_actions(
         session=session,
         region=region,
@@ -2810,6 +2921,9 @@ def run_apply_mode(
         project_root=project_root,
     )
     for act in iam_reconciled:
+        if act not in executed_actions:
+            executed_actions.append(act)
+    for act in ssm_reconciled:
         if act not in executed_actions:
             executed_actions.append(act)
     for act in secret_results:

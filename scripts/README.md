@@ -218,6 +218,10 @@ When adopting brownfield environments where IAM roles may have been partially de
    - Regional STS endpoints in `us-east-1` exhibit eventual consistency. Whenever a role is newly created or a trust policy is updated (`roles_mutated = True`), `aws_onboard.py` automatically pauses for a safe 12-second propagation window before starting SAM build/deploy, preventing `The role defined for the function cannot be assumed by Lambda` errors.
 9. **Resilient Secrets Resolution (Silenced 404s)**:
    - Runtime secret resolution in `handlers/shared.py` catches `ResourceNotFoundException` at `DEBUG` level and returns empty strings cleanly for unconfigured optional secrets (such as Slack webhooks), preventing false alarms in CloudWatch logs.
+10. **Zero-Touch SSM Documents Pre-Provisioning & Drift Reconciliation**:
+    - `ensure_ssm_documents` discovers and creates both `incidents-observe-readonly` and `incidents-repair-restricted` directly via `boto3` from `infra/ssm/*.json` before SAM deployment.
+    - Reconciles regex parameter pattern drift automatically (`update_document` + `$DEFAULT` version update) without manual CLI interventions.
+    - In `--mode apply`, `build_cfn_parameters` forces `CreateSsmDocuments="false"`, preventing CloudFormation `DocumentAlreadyExists` collisions and eliminating runtime `InvalidDocument` failures when autonomous agents invoke SSM.
 
 ---
 
