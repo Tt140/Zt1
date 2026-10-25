@@ -717,6 +717,51 @@ class TestAwsOnboardPlanner:
         # Must protect events in IngestRole, AgentRole, ObserverRole, ExecutorRole, SlackCallbackRole
         assert found_append_only_stmts >= 5
 
+    def test_cwagent_alarms_dimension_consistency_in_template_yaml(self):
+        """
+        Verify that HighDiskAlarm and HighMemoryAlarm in template.yaml specify
+        ONLY the 'InstanceId' dimension, exactly matching the CWAgent aggregation_dimensions
+        configured on the EC2 instances. Prevents ghost metric streams and blind alarms caused
+        by spurious dimensions like path="/".
+        """
+        class CfnLoader(yaml.SafeLoader):
+            pass
+
+        def default_ctor(loader, tag_suffix, node):
+            if isinstance(node, yaml.ScalarNode):
+                return loader.construct_scalar(node)
+            elif isinstance(node, yaml.SequenceNode):
+                return loader.construct_sequence(node)
+            elif isinstance(node, yaml.MappingNode):
+                return loader.construct_mapping(node)
+            return None
+
+        CfnLoader.add_multi_constructor("!", default_ctor)
+
+        template_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../template.yaml"))
+        assert os.path.exists(template_path)
+
+        with open(template_path, "r", encoding="utf-8") as f:
+            cfn = yaml.load(f, Loader=CfnLoader)
+
+        resources = cfn.get("Resources", {})
+        high_disk = resources.get("HighDiskAlarm", {}).get("Properties", {})
+        high_mem = resources.get("HighMemoryAlarm", {}).get("Properties", {})
+
+        # HighDiskAlarm must monitor CWAgent disk_used_percent with ONLY InstanceId
+        assert high_disk.get("Namespace") == "CWAgent"
+        assert high_disk.get("MetricName") == "disk_used_percent"
+        disk_dims = high_disk.get("Dimensions", [])
+        assert len(disk_dims) == 1, f"HighDiskAlarm must have exactly 1 dimension (InstanceId), got {disk_dims}"
+        assert disk_dims[0].get("Name") == "InstanceId"
+
+        # HighMemoryAlarm must monitor CWAgent mem_used_percent with ONLY InstanceId
+        assert high_mem.get("Namespace") == "CWAgent"
+        assert high_mem.get("MetricName") == "mem_used_percent"
+        mem_dims = high_mem.get("Dimensions", [])
+        assert len(mem_dims) == 1, f"HighMemoryAlarm must have exactly 1 dimension (InstanceId), got {mem_dims}"
+        assert mem_dims[0].get("Name") == "InstanceId"
+
     def test_ensure_client_secrets_provisions_missing_secrets(self, tmp_path):
         """
         Verifies that ensure_client_secrets:

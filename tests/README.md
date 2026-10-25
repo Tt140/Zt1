@@ -1,23 +1,23 @@
-# 565-Test Verification & Conformance Matrix (`tests/`)
+# 566-Test Verification & Conformance Matrix (`tests/`)
 
-[![Pytest Suite](https://img.shields.io/badge/pytest-565%20passed%20(100%25)-brightgreen?style=for-the-badge&logo=pytest)](#)
+[![Pytest Suite](https://img.shields.io/badge/pytest-566%20passed%20(100%25)-brightgreen?style=for-the-badge&logo=pytest)](#)
 [![Zero Failures](https://img.shields.io/badge/failures-0-brightgreen?style=for-the-badge)](#)
 [![Pass Rate](https://img.shields.io/badge/pass%20rate-100%25-brightgreen?style=for-the-badge)](#)
 
 This directory contains the comprehensive, multi-layer verification test suite for the **Autonomous Cloud Incident Remediation System**.
 
-The test suite comprises **565 automated tests** spanning unit testing, pure-domain reducer validation, zero-trust security invariant enforcement, storage backend conformance, serverless Lambda handler simulation, anti-hesitation guards, socket mode lifecycle, dual asynchronous Slack notifications, Zero-Touch SSM reconciliation, and end-to-end incident lifecycle testing.
+The test suite comprises **566 automated tests** spanning unit testing, pure-domain reducer validation, zero-trust security invariant enforcement, storage backend conformance, serverless Lambda handler simulation, anti-hesitation guards, socket mode lifecycle, dual asynchronous Slack notifications, Zero-Touch SSM reconciliation, and end-to-end incident lifecycle testing.
 
 ---
 
-## 1. Test Suite Architecture (`565 Tests`)
+## 1. Test Suite Architecture (`566 Tests`)
 
 The verification matrix is structured across 6 dedicated test directories and 3 specialized root integration suites:
 
 ```text
 tests/
 ├── agent/                  <── 149 Tests: Reasoning Loop, Anti-Hesitation, Socket Mode, PID Isolation & Conclude
-├── unit/                   <── 108 Tests: Domain Reducer, Onboarding CLI & IAM/SSM Reconciliation, Observer & Router
+├── unit/                   <── 109 Tests: Domain Reducer, Onboarding CLI & IAM/SSM Reconciliation, Observer & Router
 ├── policy/                 <──  98 Tests: PolicyGate, Invariants I-01..I-16 & Cryptographic HMAC Auth
 ├── handlers/               <──  60 Tests: Serverless Handlers, Dual Async Notifications & Slack Lifecycle
 ├── conformance/            <──  52 Tests: Cross-Backend EventStore Conformance (DynamoDB/SQLite/Memory)
@@ -26,7 +26,7 @@ tests/
 ├── eval/                   <──  11 Tests: Replay Benchmark Scenarios & MTTR Verification
 └── test_no_runbooks.py     <──   4 Tests: Proof of Zero-Runbook Dynamic Reasoning
 ───────────────────────────────────────────────────────────────────────────
-Total:                          565 Tests (100% Pass Rate - 0 Failures)
+Total:                          566 Tests (100% Pass Rate - 0 Failures)
 ```
 
 ### Detailed Suite Breakdown & Architectural Objectives
@@ -34,7 +34,7 @@ Total:                          565 Tests (100% Pass Rate - 0 Failures)
 | Suite Path | Test Count | Primary Target Modules | Architectural Objective & Verification Scope |
 |---|---|---|---|
 | **`tests/agent/`** | **149** | `src/agent/` | **Autonomous Reasoning Loop & Anti-Hesitation**:<br/>• Tests `ReasoningLoop.step()` state progressions, hypothesis updates, and cycle limits.<br/>• Verifies **Anti-Hesitation Engine** breaking analysis paralysis at confidence $\ge 0.70$.<br/>• Verifies **Slack Socket Mode** lifecycle and live interactive approvals.<br/>• Validates **Target Process Isolation** protecting system daemons and preventing rogue kills.<br/>• Tests **Cross-Round Deduplication** ensuring executed repairs fast-path directly to `conclude`. |
-| **`tests/unit/`** | **108** | `src/domain/`<br/>`scripts/aws_onboard.py` | **Core Unit & IAM/SSM Engine Verification**:<br/>• Verifies pure domain event sourcing reducer (`fold`) determinism and immutability.<br/>• Tests `aws_onboard.py` 7-layer audit discovery, delta planner, and brownfield/greenfield options.<br/>• Tests IAM eventual consistency backoff retry logic and CloudFormation dead-stack self-healing.<br/>• Verifies 7-role IAM core engine reconciliation, Zero-Touch SSM Document bootstrap & drift repair, S3 snapshot access, and expanded SSM command permissions.<br/>• Validates strictly matched PID parsing and invariant I-15 TLS certificate compliance. |
+| **`tests/unit/`** | **109** | `src/domain/`<br/>`scripts/aws_onboard.py` | **Core Unit & IAM/SSM Engine Verification**:<br/>• Verifies pure domain event sourcing reducer (`fold`) determinism and immutability.<br/>• Tests `aws_onboard.py` 7-layer audit discovery, delta planner, and brownfield/greenfield options.<br/>• Tests IAM eventual consistency backoff retry logic and CloudFormation dead-stack self-healing.<br/>• Verifies 7-role IAM core engine reconciliation, Zero-Touch SSM Document bootstrap & drift repair, S3 snapshot access, and expanded SSM command permissions.<br/>• Validates strictly matched PID parsing and invariant I-15 TLS certificate compliance. |
 | **`tests/policy/`** | **98** | `src/policy/` | **Security Boundary Validation**:<br/>• Tests all 16 security invariants (`I-01` to `I-16`) individually and in combination.<br/>• Validates tier classification (`T0` Read-Only, `T1` Autonomous Safe, `T2` Require Human Approval, `T3` Reject).<br/>• Verifies canonical JSON serialization and deterministic `plan_hash` generation.<br/>• Tests cryptographic `HMAC-SHA256` authorization tag validation (`compute_auth_tag`). |
 | **`tests/handlers/`** | **60** | `handlers/` | **Serverless Function Verification**:<br/>• Simulates EventBridge CloudWatch alarm events for `ingest.py` and verifies dual async dispatch (`NOTIFIER_FN` for `incident_opened` + `AGENT_FN`).<br/>• Tests `agent.py` async dispatching, `action_proposed` T1 Slack notification, and lease release in `finally:` blocks.<br/>• Verifies `observer.py` T0 SSM invocation and telemetry retrieval.<br/>• Tests `executor_fn.py` STS AssumeRole credential scoping and HMAC token validation.<br/>• Verifies `slack_callback.py` Slack signature validation (`X-Slack-Signature`) and 5-minute replay window defense.<br/>• Tests `notifier.py` resilient Slack webhook delivery and graceful fallback. |
 | **`tests/conformance/`** | **52** | `src/store/` | **Storage Backend Parity Verification**:<br/>• Executes identical conformance test suites against `DynamoDBEventStore`, `SQLiteEventStore`, and `InMemoryEventStore`.<br/>• Validates strict monotonic event append-only ordering and version concurrency checks.<br/>• Tests atomic alarm deduplication (`create_if_absent`).<br/>• Tests distributed lease acquisition, heartbeats, TTL expiration, and release semantics.<br/>• Verifies transparent S3 offload for event payloads exceeding 300 KB. |
@@ -49,13 +49,13 @@ Total:                          565 Tests (100% Pass Rate - 0 Failures)
 
 All tests are managed via `pytest`. The environment requires Python 3.10+ and standard dev dependencies.
 
-### 1. Run the Entire Test Suite (565 Tests)
+### 1. Run the Entire Test Suite (566 Tests)
 ```bash
 python3 -m pytest -q
 ```
 *Expected Output:*
 ```text
-============================= 565 passed in 30.02s =============================
+============================= 566 passed in 29.47s =============================
 ```
 
 ### 2. Run Specific Subsystems

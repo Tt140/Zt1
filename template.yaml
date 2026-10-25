@@ -774,8 +774,6 @@ Resources:
       Dimensions:
         - Name: InstanceId
           Value: !Ref TargetInstanceId
-        - Name: path
-          Value: "/"
       Statistic: Average
       Period: 60
       EvaluationPeriods: 1
