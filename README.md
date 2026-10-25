@@ -3,7 +3,7 @@
 [![AWS Hackathon](https://img.shields.io/badge/AWS%20Hackathon-Strands%20Decider%202B%20%7C%20Amazon%20Bedrock-orange?style=for-the-badge)](#)
 [![YouTube Demo](https://img.shields.io/badge/YouTube%20Demo-Live%20Remediation-red?style=for-the-badge&logo=youtube)](https://youtu.be/aHZh-q39Zik?si=u7Z483rJQfceuCBe)
 [![Pattern Tags](https://img.shields.io/badge/Pattern%20Tags-%23strands--decider--2b%20%7C%20%23tool--selection-blue?style=for-the-badge)](#-mandatory-hackathon-tags)
-[![Pytest Suite](https://img.shields.io/badge/pytest-569%20passed%20(100%25)-brightgreen?style=for-the-badge&logo=pytest)](tests/README.md)
+[![Pytest Suite](https://img.shields.io/badge/pytest-573%20passed%20(100%25)-brightgreen?style=for-the-badge&logo=pytest)](tests/README.md)
 [![License](https://img.shields.io/badge/License-Apache--2.0-green?style=for-the-badge)](LICENSE)
 [![Zero Runbooks](https://img.shields.io/badge/Zero--Runbooks-100%25%20Dynamic%20Reasoning-blue?style=for-the-badge)](tests/test_no_runbooks.py)
 [![Security Invariants](https://img.shields.io/badge/Security%20Invariants-16%20Enforced%20(I--01..I--16)-red?style=for-the-badge)](src/README.md#4-the-16-security-invariants)
@@ -80,7 +80,7 @@ This repository is strictly structured into modular, self-documenting subsystems
 | **Infrastructure as Code** | [`infra/README.md`](infra/README.md) | AWS SAM `template.yaml`, Zero-Trust SSM Documents (`incidents-observe-readonly`, `incidents-repair-restricted`), conditional provisioning, and SCP-immune architecture. |
 | **Onboarding & Delta CLI** | [`scripts/README.md`](scripts/README.md) | 7-Layer Deep Discovery Engine (`aws_onboard.py`), Greenfield vs Brownfield Delta Planning, IAM propagation retry backoff, dead-stack self-healing, and CFN failure forensic extraction. |
 | **Universal Live Investigation** | [`demos/README.md`](demos/README.md) | Zero-scripted dynamic incident investigation (`run_live_incident.py`), auto-discovery via `IncidentsAgent=true`, and Slack Socket Mode interactive approval. |
-| **Verification & Tests** | [`tests/README.md`](tests/README.md) | **569 automated tests** (100% pass rate), cross-backend storage conformance (`DynamoDB`, `SQLite`, `InMemory`), defensive shell injection hardening, and E2E simulation. |
+| **Verification & Tests** | [`tests/README.md`](tests/README.md) | **573 automated tests** (100% pass rate), cross-backend storage conformance (`DynamoDB`, `SQLite`, `InMemory`), defensive shell injection hardening, and E2E simulation. |
 
 ---
 
@@ -214,6 +214,30 @@ This platform was engineered from first principles to be **100% non-intrusive, w
 | **Regional SCP & IAM Constraints** | Cross-region IAM roles triggering SCP `AccessDenied` | **SCP-Immune BYOK Architecture** with zero cross-region dependencies |
 | **Core IAM Role Gaps & Collision Drift** | Missing roles cause `AccessDenied`; duplicate CloudFormation `Add` triggers `ResourceExistenceCheck` | **Self-Healing Core IAM & Zero-Collision IaC Engine** (7-role idempotent reconciliation, `CreateCoreIamRoles=false` on apply, SAM `!If` conditional linkage, ordered principal generation, wildcard `incidents-*` invocation, 12s STS propagation delay) |
 
+### 7. Triple-Defense Deduplication Lifecycle (Production Self-Healing)
+In mission-critical AWS environments, alarm deduplication must balance two competing requirements: **preventing alert storms** during an active outage, while **instantly unblocking new alerts** as soon as an issue is remediated. The system implements a triple-defense architecture:
+1. **Immediate Post-Resolution Release (`store.release_dedupe`)**: The instant an incident reaches `RESOLVED` or `CONCLUDED`, the agent automatically calls `release_dedupe(dedupe_key)` on DynamoDB `incidents-dedup`. The lock is cleared within milliseconds, enabling immediate re-triggering if the server degrades again.
+2. **State-Aware Ingestion Fallback (`handlers/ingest.py`)**: When an alarm fires for an existing deduplication key, the ingest sentinel checks the prior incident's terminal state in the EventStore. If the earlier incident reached `resolved` or `escalated`, the stale lock is automatically purged in-flight, preventing dropped alerts.
+3. **Automated 24h DynamoDB TTL Safety Net (`expires_epoch`)**: Every record written to `incidents-dedup` carries an epoch TTL timestamp. DynamoDB native Time-To-Live continuously reclaims orphaned entries in the background, guaranteeing that no host can ever enter an unrecoverable suppression deadlock.
+
+### 8. Intelligent Anti-Repetition & PolicyGate Denial Interception (Fast-Fail Circuit Breaker)
+Autonomous LLM agents commonly suffer from "prompt paralysis" when a proposed action is rejected: they modify cosmetic wording (e.g., tweaking descriptions or rollback justifications) while stubbornly repeating the exact same prohibited command. The platform eliminates this vulnerability with five coordinated safeguards:
+* **Zero-Trust Invariant Interception**: Evaluates commands against all 16 Security Invariants (`I-01` to `I-16`) at Step 6—**before** Tier classification or human approval. Invariant violations (such as `I-02` prohibiting SSH keyword tampering) trigger an immediate, non-bypassable `Tier.T3 Hard Deny`.
+* **Semantic Remediation Deduplication**: Normalizes commands across rounds (`command` and `resource`), stripping leading `sudo` and whitespace. Duplicate remediation commands are intercepted even when the LLM generates entirely new narrative text.
+* **Prohibited Commands Blacklist (`denied_commands`)**: Every command rejected by PolicyGate is permanently blacklisted for that incident. The registry persists across reasoning cycles and agent invocations.
+* **Fast-Fail Escalation Circuit Breaker**: If an agent attempts to re-propose a hard-denied command, the loop intercepts the call and immediately escalates the ticket to Slack (`LoopTermination.ESCALATED`). It refuses to waste token budget spinning across remaining cycles.
+* **Dynamic Denial Steering**: Injects explicit `ACTION FORBIDDEN` directives and policy rejection reasons into `remediation_history`, dynamically steering the LLM toward viable alternative tactics (e.g., executing evidence-backed surgical process termination via specific numeric PID `kill <pid>` rather than attempting protected service stops).
+
+### 9. Multi-Tier Governance Matrix (Machine-Speed T1 vs. Human T2 vs. Hard-Deny T3)
+The system decouples **Reasoning Autonomy** from **Execution Authority**, enforcing a formal 4-tier risk classification:
+
+| Governance Tier | Operational Scope | Autonomous Execution? | Human Approval Required? | Example Scenarios |
+| :--- | :--- | :---: | :---: | :--- |
+| **Tier T0** | Read-Only Inspection | ✅ **Machine Speed** | ❌ None | `ps aux`, `df -h`, `journalctl -u <svc>`, `ss -tulpn` |
+| **Tier T1** | Safe Surgical Remediation | ✅ **Machine Speed** | ❌ None (Pre-Approved) | `truncate -s 0 /var/log/app.log`, `systemctl restart <normal-svc>`, surgical `kill <pid>` (PID > 100, non-sensitive) |
+| **Tier T2** | High-Impact Mutation | ⏸️ **Awaiting Approval** | ✅ **Mandatory (Slack BlockKit)** | `systemctl stop <svc>`, process termination linked to core infrastructure daemons, unknown risk claims |
+| **Tier T3** | Security Invariant Violation | 🚫 **Hard Denied** | 🚫 **Cannot be Approved** | Tampering with SSH (`/etc/ssh`, `sshd`), cloud credentials, IMDS metadata, audit logs, or PID 1 |
+
 ---
 
 ## 🧪 Quickstart: Running the Agent & Tests
@@ -239,7 +263,7 @@ sam deploy --guided
 
 ---
 
-### 3. Running the Automated Test Suite (569 Tests - 100% Pass Rate)
+### 3. Running the Automated Test Suite (573 Tests - 100% Pass Rate)
 Install dependencies and run the complete test suite:
 ```bash
 pip install -r requirements-dev.txt

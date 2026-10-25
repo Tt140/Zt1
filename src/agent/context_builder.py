@@ -246,6 +246,10 @@ def build_context(
                         fail_reason = str(le.mismatch_details.get("stderr", ""))[:200]
                 if fail_reason:
                     line += f" | failure_output: {fail_reason!r}"
+            elif status == "rejected" or (s_id in state.policy_decisions and state.policy_decisions[s_id].decision.value == "deny"):
+                pol = state.policy_decisions.get(s_id)
+                pol_reasons = "; ".join(pol.reasons) if (pol and pol.reasons) else "PolicyGate Invariant violation"
+                line += f" | policy_rejection: {pol_reasons!r} | ACTION FORBIDDEN: DO NOT RETRY THIS COMMAND"
             history_lines.append(line)
         incident_summary += "\n".join(history_lines) + "\n"
 

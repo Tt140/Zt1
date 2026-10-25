@@ -103,11 +103,13 @@ To eliminate tool selection hallucinations and reduce inference latency by over 
 > **Reusable Pattern Asset:** The standalone, portable implementation of this pattern is available at [`patterns/strands_secops_tool_selection/`](../patterns/strands_secops_tool_selection/README.md).
 
 ### 3.2 Anti-Hesitation Engine & Production Loop Guards
-The reasoning loop in [`src/agent/loop.py`](agent/loop.py) enforces 4 hard production guards:
+The reasoning loop in [`src/agent/loop.py`](agent/loop.py) enforces 6 hard production guards:
 1. **Anti-Hesitation Guard**: When a model loops in repetitive hypothesis refinement at confidence $\ge 0.70$, the engine breaks analysis paralysis and forces a mutation proposal.
 2. **Prerequisite Readiness Guard**: Prohibits starting a failed systemd unit until diagnostic telemetry (`status`, `journalctl`) has been inspected to uncover the root cause.
 3. **Target Isolation Guard**: Forbids terminating healthy service PIDs when a service is `active (running)`, distinguishing legitimate processes from rogue port squatters.
 4. **Cross-Round Deduplication & Fast-Path Conclude**: If an action (e.g. `systemctl restart <unit>`) already succeeded in a prior round and the unit is operational, the guard intercepts duplicate proposals across rounds and immediately redirects the agent to `conclude` as resolved.
+5. **PolicyGate Denial Interception & Anti-Repetition Blacklist**: Tracks hard-denied commands across cycles. When PolicyGate rejects an action (e.g. under Invariant `I-02`), the engine records the command in `denied_commands`, injects an explicit `ACTION FORBIDDEN` directive into context, and enforces **Fast-Fail Escalation** upon repeated attempts rather than burning through token cycles.
+6. **Semantic Remediation Deduplication**: Normalizes commands (`command` and `resource`) independently of LLM description phrasing, guaranteeing that cosmetic wording tweaks cannot bypass deduplication.
 
 ---
 
@@ -166,3 +168,8 @@ assert len(state.hypotheses) > 0
 
 * **Lease Locking (`incidents-leases`)**: Employs DynamoDB conditional expressions to guarantee that only a single worker agent executes cycles for an incident at any given second.
 * **Large Blob Offloading**: When an observation output exceeds 300 KB, the store automatically compresses and offloads the raw stdout to the S3 Blobs bucket, replacing the event payload with an immutable S3 URI pointer.
+* **Triple-Defense Deduplication Lifecycle (`incidents-dedup`)**:
+  1. *Immediate Post-Resolution Release*: On incident resolution (`RESOLVED` or `CONCLUDED`), `release_dedupe(dedupe_key)` purges the deduplication lock, immediately unblocking future alarms on the recovered host.
+  2. *State-Aware Ingestion Fallback*: The ingest Lambda checks prior incident states; if an earlier incident reached a terminal state (`resolved`, `escalated`), it auto-clears stale keys.
+  3. *Native 24h DynamoDB TTL Safety Net*: In-flight records automatically expire via native DynamoDB TTL (`expires_epoch`), guaranteeing zero permanent suppression deadlocks.
+

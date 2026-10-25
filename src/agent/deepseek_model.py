@@ -133,6 +133,7 @@ escalate:
 - Do not repeat a command already executed in prior evidence.
 - propose_step: command must be a single direct command without shell interpreter and without chaining (&&, ;, | forbidden). When updated certificate is on disk (e.g. _renewed.crt), use cp to copy to active path with category="E2" and resource active cert path, or systemctl restart/start; private keys in /etc/ssl/private are security protected and prohibited from modification (I-15).
 - propose_step: declared_effects and rollback_plan must be populated.
+- propose_step PolicyGate compliance: If a proposed step was rejected by PolicyGate (status: rejected in remediation_history), you are STRICTLY PROHIBITED from re-proposing that command or altering only its description. Invariant I-02 strictly prohibits SSH keywords in execution specs; if an offending process runs under a unit with ssh in its name, do not stop the unit with systemctl, but terminate the specific rogue process directly by its numeric PID (e.g. `kill <pid>`) which contains no SSH keywords and is an authorized surgical action. If no alternative authorized remediation exists, call escalate immediately.
 - evidence_id in update_hypotheses: Use the latest evidence_id from collected evidence.
 """
 class DeepSeekModel(ModelInterface):

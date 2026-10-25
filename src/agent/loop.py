@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Optional
@@ -183,6 +184,23 @@ class ReasoningLoop:
         cycle = int(state.budgets.cycles)
 
         seen_calls: set[tuple[str, str]] = set()
+        seen_propose_cmds: set[str] = set()
+        denied_commands: dict[str, str] = {}
+        denied_command_attempts: dict[str, int] = {}
+        if getattr(state, "steps", None):
+            for s_id, s in state.steps.items():
+                p_cmd = s.execution_spec.get("command", "") if isinstance(s.execution_spec, dict) else ""
+                is_pol_denied = (s_id in state.policy_decisions and getattr(state.policy_decisions[s_id].decision, "value", "") == "deny")
+                if p_cmd and (getattr(s, "status", None) == "rejected" or is_pol_denied):
+                    p_clean = str(p_cmd).strip()
+                    p_norm = re.sub(r"^sudo\s+", "", p_clean).strip()
+                    p_pol = state.policy_decisions.get(s_id)
+                    p_reasons = "; ".join(p_pol.reasons) if (p_pol and p_pol.reasons) else "PolicyGate rejection"
+                    denied_commands[p_clean] = p_reasons
+                    denied_commands[p_norm] = p_reasons
+                    denied_command_attempts[p_clean] = 1
+                    denied_command_attempts[p_norm] = 1
+
         executed_history: list[str] = []
         failed_history: list[str] = []
         failed_attempts: list[dict[str, Any]] = []
@@ -574,8 +592,6 @@ class ReasoningLoop:
                         reasoning=f"[Progress Guard default observe command] {tool_call.reasoning}".strip(),
                     )
                 else:
-                    import re
-
                     # 1. Reject find commands with -exec or -delete: explicit rejection to prevent side effects or semantic corruption
                     has_find = cmd.startswith("find ") or cmd == "find" or cmd.startswith("sudo find ")
                     has_find_exec = has_find and bool(re.search(r"\bfind\b.*-(?:exec|execdir|delete)\b", cmd))
@@ -675,7 +691,6 @@ class ReasoningLoop:
                 elif isinstance(args, dict) and args.get("command"):
                     cmd = args.get("command", "")
                 clean_cmd = str(cmd).strip()
-                import re
                 norm_cmd = re.sub(r"^sudo\s+", "", clean_cmd).strip()
 
                 # ── Edge Case 1: Check whether target service is already active (running) ──
@@ -947,6 +962,89 @@ class ReasoningLoop:
                         reasoning=f"4-Layer Production Triage: Must inspect {', '.join(missing_triage)} before declaring system healthy.",
                     )
 
+            # ── PolicyGate Denial Re-planning & Semantic Remediation Deduplication Gate ──
+            if tool_call.tool_name == "propose_step":
+                p_args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+                p_spec = p_args.get("execution_spec", {}) if isinstance(p_args, dict) else {}
+                p_cmd = str(p_spec.get("command") or p_args.get("command") or "").strip()
+                p_norm = re.sub(r"^sudo\s+", "", p_cmd).strip()
+
+                # 1. Denied Commands Interception & Fast-Escalation
+                if p_cmd in denied_commands or p_norm in denied_commands:
+                    denied_reason = denied_commands.get(p_cmd) or denied_commands.get(p_norm) or "PolicyGate Hard Deny"
+                    attempts = max(denied_command_attempts.get(p_cmd, 0), denied_command_attempts.get(p_norm, 0)) + 1
+                    denied_command_attempts[p_cmd] = attempts
+                    denied_command_attempts[p_norm] = attempts
+                    logger.warning(
+                        f"Loop guard: Repeated propose_step for denied command {p_cmd!r} (attempt {attempts}). "
+                        f"Reason: {denied_reason}"
+                    )
+                    if attempts >= 2:
+                        self._escalate_to_store(
+                            state,
+                            f"Fast Escalation: Agent repeatedly re-proposed command {p_cmd!r} which was hard-denied by PolicyGate ({denied_reason}). Escalating for human intervention.",
+                        )
+                        state = self._executor._rebuild_state(state.incident_id)
+                        return LoopResult(
+                            termination=LoopTermination.ESCALATED,
+                            cycles_completed=i + 1,
+                            final_state=state,
+                            tool_calls=tool_calls,
+                            tool_results=tool_results,
+                        )
+                    else:
+                        result = ToolResult(
+                            tool_name="propose_step",
+                            success=False,
+                            message=(
+                                f"Command {p_cmd!r} was already REJECTED by PolicyGate: {denied_reason}. "
+                                "You are strictly prohibited from repeating this command or altering only its description. "
+                                "You must switch remediation strategy (e.g. terminate the offending process directly by its specific numeric PID with kill <pid>, without forbidden keywords) or call escalate."
+                            ),
+                        )
+                        tool_calls.append(tool_call)
+                        tool_results.append(result)
+                        failed_history.append(f"propose_step: repeated denied command {p_cmd[:50]!r}")
+                        failed_attempts.append({
+                            "tool_name": "propose_step",
+                            "arguments": tool_call.arguments,
+                            "error_message": result.message,
+                        })
+                        last_tool = "propose_step"
+                        consecutive_failed_tools += 1
+                        no_new_evidence_cycles += 1
+                        continue
+
+                # 2. Semantic Remediation Deduplication (Across description variations)
+                if p_norm:
+                    if p_norm in seen_propose_cmds:
+                        logger.warning(
+                            f"Loop guard: duplicate propose_step command detected for '{p_norm}'. "
+                            "Rejecting duplicate to prevent loop."
+                        )
+                        result = ToolResult(
+                            tool_name="propose_step",
+                            success=False,
+                            message=(
+                                f"Duplicate command rejected: propose_step with command '{p_norm}' was already executed or proposed. "
+                                "Do not repeat identical remediation commands even with rephrased descriptions. "
+                                "Switch remediation strategy or verify system status or conclude if resolved."
+                            ),
+                        )
+                        tool_calls.append(tool_call)
+                        tool_results.append(result)
+                        failed_attempts.append({
+                            "tool_name": "propose_step",
+                            "arguments": tool_call.arguments,
+                            "error_message": result.message,
+                        })
+                        failed_history.append(f"propose_step: duplicate command {p_norm[:50]!r} rejected")
+                        last_tool = "propose_step"
+                        consecutive_failed_tools += 1
+                        no_new_evidence_cycles += 1
+                        continue
+                    seen_propose_cmds.add(p_norm)
+
             call_key = (tool_call.tool_name, json.dumps(tool_call.arguments, sort_keys=True))
             if call_key in seen_calls:
                 # Exact literal duplicate of tool and arguments: prevent loop without imposing static fallback command
@@ -1001,14 +1099,43 @@ class ReasoningLoop:
             result, state = self._executor.execute(tool_call, state)
             tool_results.append(result)
 
+            # Check if propose_step was denied by PolicyGate
+            is_step_denied = False
+            denied_reason_msg = ""
+            if tool_call.tool_name == "propose_step":
+                p_args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+                p_spec = p_args.get("execution_spec", {}) if isinstance(p_args, dict) else {}
+                p_cmd = str(p_spec.get("command") or p_args.get("command") or "").strip()
+                p_norm = re.sub(r"^sudo\s+", "", p_cmd).strip()
+
+                if result.data and result.data.get("policy_decision") == "deny":
+                    is_step_denied = True
+                    denied_reason_msg = "; ".join(result.data.get("policy_reasons", []))
+                elif result.message and "PolicyGate REJECTED" in result.message:
+                    is_step_denied = True
+                    denied_reason_msg = result.message
+                elif any(getattr(s, "status", None) == "rejected" for s in state.steps.values()):
+                    latest_step = list(state.steps.values())[-1]
+                    if getattr(latest_step, "status", None) == "rejected":
+                        is_step_denied = True
+                        pol = state.policy_decisions.get(latest_step.step_id)
+                        denied_reason_msg = "; ".join(pol.reasons) if (pol and pol.reasons) else "PolicyGate Invariant rejection"
+
+                if is_step_denied and (p_cmd or p_norm):
+                    denied_commands[p_cmd] = denied_reason_msg or "PolicyGate Deny"
+                    denied_commands[p_norm] = denied_reason_msg or "PolicyGate Deny"
+                    denied_command_attempts[p_cmd] = max(denied_command_attempts.get(p_cmd, 0), 1)
+                    denied_command_attempts[p_norm] = max(denied_command_attempts.get(p_norm, 0), 1)
+
             call_desc = f"{tool_call.tool_name}({tool_call.arguments.get('command') or tool_call.arguments.get('metric_name') or ''})"
             last_tool = tool_call.tool_name
-            if not result.success:
-                failed_history.append(f"{call_desc}: {result.message[:80]}")
+            if not result.success or is_step_denied:
+                err_msg = denied_reason_msg if is_step_denied else result.message
+                failed_history.append(f"{call_desc}: {err_msg[:80]}")
                 failed_attempts.append({
                     "tool_name": tool_call.tool_name,
                     "arguments": tool_call.arguments,
-                    "error_message": result.message,
+                    "error_message": err_msg,
                 })
                 last_successful_tool = None
                 last_executed_tool = None
@@ -1035,7 +1162,7 @@ class ReasoningLoop:
 
             # Stop investigation loop once a valid remediation step accepted by PolicyGate is proposed (Stop on Valid Proposal)
             valid_steps = [s for s in state.steps.values() if getattr(s, "status", None) != "rejected"]
-            if tool_call.tool_name == "propose_step" and result.success and valid_steps:
+            if tool_call.tool_name == "propose_step" and result.success and not is_step_denied and valid_steps:
                 return LoopResult(
                     termination=LoopTermination.PROPOSED,
                     cycles_completed=i + 1,
