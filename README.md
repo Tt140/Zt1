@@ -80,7 +80,7 @@ This repository is strictly structured into modular, self-documenting subsystems
 | **Infrastructure as Code** | [`infra/README.md`](infra/README.md) | AWS SAM `template.yaml`, Zero-Trust SSM Documents (`incidents-observe-readonly`, `incidents-repair-restricted`), conditional provisioning, and SCP-immune architecture. |
 | **Onboarding & Delta CLI** | [`scripts/README.md`](scripts/README.md) | 7-Layer Deep Discovery Engine (`aws_onboard.py`), Greenfield vs Brownfield Delta Planning, IAM propagation retry backoff, dead-stack self-healing, and CFN failure forensic extraction. |
 | **Universal Live Investigation** | [`demos/README.md`](demos/README.md) | Zero-scripted dynamic incident investigation (`run_live_incident.py`), auto-discovery via `IncidentsAgent=true`, and Slack Socket Mode interactive approval. |
-| **Verification & Tests** | [`tests/README.md`](tests/README.md) | **546 automated tests** (100% pass rate), cross-backend storage conformance (`DynamoDB`, `SQLite`, `InMemory`), defensive shell injection hardening, and E2E simulation. |
+| **Verification & Tests** | [`tests/README.md`](tests/README.md) | **562 automated tests** (100% pass rate), cross-backend storage conformance (`DynamoDB`, `SQLite`, `InMemory`), defensive shell injection hardening, and E2E simulation. |
 
 ---
 
@@ -248,17 +248,20 @@ python3 -m pytest -q
 
 Verify specific architectural domains:
 ```bash
-# Verify the 16 Security Invariants (93 tests)
+# Verify the 16 Security Invariants (98 tests)
 python3 -m pytest tests/policy/ -v
 
 # Verify Autonomous Reasoning Loop, Anti-Hesitation & Socket Mode (149 tests)
 python3 -m pytest tests/agent/ -v
 
+# Verify Core Domain, Onboarding CLI & IAM Reconciliation (105 tests)
+python3 -m pytest tests/unit/ -v
+
+# Verify Serverless Handlers & Dual Notifications (60 tests)
+python3 -m pytest tests/handlers/ -v
+
 # Verify Storage Conformance across DynamoDB, SQLite & Memory (52 tests)
 python3 -m pytest tests/conformance/ -v
-
-# Verify Serverless Handlers & Ingest Dimensions (61 tests)
-python3 -m pytest tests/handlers/ -v
 ```
 
 ---
