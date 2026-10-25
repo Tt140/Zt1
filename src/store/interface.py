@@ -56,6 +56,14 @@ class EventStoreBase(ABC):
         """
 
     @abstractmethod
+    def release_dedupe(self, dedupe_key: str) -> bool:
+        """
+        Releases/removes the dedupe_key from the deduplication index upon incident resolution.
+        Enables immediate reception of subsequent alarms on the same resource.
+        Returns True if removed, False otherwise.
+        """
+
+    @abstractmethod
     def append(
         self,
         incident_id: str,

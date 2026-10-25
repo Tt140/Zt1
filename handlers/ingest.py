@@ -160,7 +160,26 @@ def handler(event: dict, context) -> dict:
         iid, created = store.create_if_absent(dedupe_key, header)
 
         if not created:
-            logger.info(f"Duplicate alarm — incident already exists: {iid}")
+            # State-Aware Check: If prior incident was already resolved or escalated,
+            # release stale dedupe_key and open a new incident for this recurring alarm.
+            try:
+                events = store.read(iid)
+                if events:
+                    from src.domain.reducer import fold
+                    from src.domain.types import IncidentPhase
+                    prior_state = fold(events)
+                    if prior_state.phase in (IncidentPhase.resolved, IncidentPhase.escalated):
+                        logger.info(
+                            f"Prior incident {iid} is {prior_state.phase.value} — "
+                            f"releasing dedupe key {dedupe_key} and opening fresh incident"
+                        )
+                        store.release_dedupe(dedupe_key)
+                        iid, created = store.create_if_absent(dedupe_key, header)
+            except Exception as e:
+                logger.warning(f"Error checking state of existing incident {iid}: {e}")
+
+        if not created:
+            logger.info(f"Duplicate alarm — incident already in progress: {iid}")
             return ok({"incident_id": iid, "created": False})
 
         # Persist IncidentOpened event

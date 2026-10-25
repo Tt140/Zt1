@@ -109,13 +109,15 @@ class DynamoEventStore(EventStoreBase):
         incident_id = header.incident_id
 
         # Step 1: Attempt to claim dedupe_key
+        now_sec = int(time.time())
         try:
             self._ddb.put_item(
                 TableName=self._dedup_tbl,
                 Item={
                     "dedupe_key": {"S": dedupe_key},
                     "incident_id": {"S": incident_id},
-                    "created_at": {"N": str(int(time.time() * 1000))},
+                    "created_at": {"N": str(now_sec * 1000)},
+                    "expires_epoch": {"N": str(now_sec + 86400)},  # 24h DynamoDB TTL safety net
                 },
                 ConditionExpression="attribute_not_exists(dedupe_key)",
             )
@@ -168,6 +170,21 @@ class DynamoEventStore(EventStoreBase):
             raise
 
         return incident_id, True
+
+    def release_dedupe(self, dedupe_key: str) -> bool:
+        """
+        Removes dedupe_key from incidents-dedup upon incident resolution.
+        Enables immediate reception of subsequent alarms on the same resource.
+        """
+        try:
+            self._ddb.delete_item(
+                TableName=self._dedup_tbl,
+                Key={"dedupe_key": {"S": dedupe_key}},
+            )
+            return True
+        except ClientError as e:
+            logger.warning(f"Failed to delete dedupe key {dedupe_key} from {self._dedup_tbl}: {e}")
+            return False
 
     # ────────────────────────────────────────────────────────────────────────
     # append — atomic CAS

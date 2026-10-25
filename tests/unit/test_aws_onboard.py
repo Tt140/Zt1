@@ -762,6 +762,37 @@ class TestAwsOnboardPlanner:
         assert len(mem_dims) == 1, f"HighMemoryAlarm must have exactly 1 dimension (InstanceId), got {mem_dims}"
         assert mem_dims[0].get("Name") == "InstanceId"
 
+    def test_dedup_table_ttl_configured_in_template_yaml(self):
+        """
+        Verify that DedupTable in template.yaml enables native DynamoDB TimeToLive (TTL)
+        on 'expires_epoch' attribute, matching LeasesTable for automatic 24-hour cleanup.
+        """
+        class CfnLoader(yaml.SafeLoader):
+            pass
+
+        def default_ctor(loader, tag_suffix, node):
+            if isinstance(node, yaml.ScalarNode):
+                return loader.construct_scalar(node)
+            elif isinstance(node, yaml.SequenceNode):
+                return loader.construct_sequence(node)
+            elif isinstance(node, yaml.MappingNode):
+                return loader.construct_mapping(node)
+            return None
+
+        CfnLoader.add_multi_constructor("!", default_ctor)
+
+        template_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../template.yaml"))
+        assert os.path.exists(template_path)
+
+        with open(template_path, "r", encoding="utf-8") as f:
+            cfn = yaml.load(f, Loader=CfnLoader)
+
+        resources = cfn.get("Resources", {})
+        dedup_tbl = resources.get("DedupTable", {}).get("Properties", {})
+        ttl_spec = dedup_tbl.get("TimeToLiveSpecification", {})
+        assert ttl_spec.get("Enabled") is True
+        assert ttl_spec.get("AttributeName") == "expires_epoch"
+
     def test_ensure_client_secrets_provisions_missing_secrets(self, tmp_path):
         """
         Verifies that ensure_client_secrets:

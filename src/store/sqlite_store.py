@@ -348,6 +348,17 @@ class SQLiteEventStore(EventStoreBase):
                 ).fetchone()
                 return row["incident_id"], False
 
+    def release_dedupe(self, dedupe_key: str) -> bool:
+        with self._write_lock:
+            conn = self._conn()
+            ts = int(time.time() * 1000)
+            cursor = conn.execute(
+                "UPDATE incidents SET dedupe_key = ? WHERE dedupe_key = ?",
+                (f"released::{ts}::{dedupe_key}", dedupe_key),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
     def append(
         self,
         incident_id: str,

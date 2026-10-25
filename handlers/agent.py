@@ -168,6 +168,7 @@ def _run_agent(
 
     elif result.termination in (LoopTermination.RESOLVED, LoopTermination.CONCLUDED):
         _notify_resolution(incident_id, state)
+        _release_dedup(store, incident_id, state)
 
     elif result.termination == LoopTermination.PROPOSED:
         final_state = result.final_state if hasattr(result, "final_state") and result.final_state else fold(store.read(incident_id))
@@ -244,3 +245,19 @@ def _notify_resolution(incident_id: str, state) -> None:
         })
     except Exception as e:
         logger.error(f"Failed to notify resolution: {e}")
+
+
+def _release_dedup(store, incident_id: str, state) -> None:
+    """Releases the dedupe key from incidents-dedup upon resolution to unblock future alarms."""
+    try:
+        dk = getattr(state, "dedupe_key", None)
+        if not dk:
+            header = store.get_header(incident_id)
+            if header:
+                dk = header.dedupe_key
+        if dk:
+            logger.info(f"Releasing dedupe key {dk!r} for resolved incident {incident_id}")
+            store.release_dedupe(dk)
+    except Exception as e:
+        logger.warning(f"Failed to release dedupe key for incident {incident_id}: {e}")
+

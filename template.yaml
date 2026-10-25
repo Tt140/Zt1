@@ -205,6 +205,9 @@ Resources:
           KeyType: HASH
       SSESpecification:
         SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expires_epoch
+        Enabled: true
 
   LeasesTable:
     Type: AWS::DynamoDB::Table

@@ -96,6 +96,60 @@ class TestIngestHandler:
         events = store.read(b1["incident_id"])
         assert len(events) == 1
 
+    def test_state_aware_dedup_opens_new_incident_after_prior_resolved(self):
+        """When a previous incident is resolved, a recurring alarm opens a new incident."""
+        store = MemoryEventStore()
+        from handlers import ingest as mod
+        from src.domain.types import build_event, EventType, Actor, IncidentResolvedPayload
+        with patch.object(mod, "get_store", return_value=store), \
+             patch.object(mod, "invoke_async"):
+            # 1. First alarm -> Incident 1 opened
+            r1 = mod.handler(_alarm_event(), context=None)
+            b1 = json.loads(r1["body"])
+            iid1 = b1["incident_id"]
+            assert b1["created"] is True
+
+            # 2. Incident 1 is resolved by agent
+            ev_resolved = build_event(
+                incident_id=iid1,
+                type=EventType.IncidentResolved,
+                actor=Actor.agent,
+                payload=IncidentResolvedPayload(
+                    verification_id="v-test-1",
+                    summary="Root blocker terminated and telemetry verified",
+                ),
+            )
+            store.append(iid1, 1, ev_resolved)
+
+            # 3. Same alarm fires again later -> State-Aware dedup sees prior is resolved,
+            # releases dedup key, and opens a fresh incident
+            r2 = mod.handler(_alarm_event(), context=None)
+            b2 = json.loads(r2["body"])
+            assert b2["created"] is True
+            assert b2["incident_id"] != iid1
+
+    def test_release_dedupe_on_store_allows_new_incident(self):
+        """Directly calling store.release_dedupe allows immediate creation with same key."""
+        store = MemoryEventStore()
+        from handlers import ingest as mod
+        with patch.object(mod, "get_store", return_value=store), \
+             patch.object(mod, "invoke_async"):
+            r1 = mod.handler(_alarm_event(), context=None)
+            b1 = json.loads(r1["body"])
+            iid1 = b1["incident_id"]
+            assert b1["created"] is True
+
+            # Release dedupe key
+            header = store.get_header(iid1)
+            assert header is not None
+            assert store.release_dedupe(header.dedupe_key) is True
+
+            # Same alarm should now create a new incident
+            r2 = mod.handler(_alarm_event(), context=None)
+            b2 = json.loads(r2["body"])
+            assert b2["created"] is True
+            assert b2["incident_id"] != iid1
+
     def test_skips_non_alarm_state(self):
         store = MemoryEventStore()
         from handlers import ingest as mod

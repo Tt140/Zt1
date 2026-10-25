@@ -75,6 +75,13 @@ class MemoryEventStore(EventStoreBase):
             self._fencing_counter[incident_id] = 0
             return incident_id, True
 
+    def release_dedupe(self, dedupe_key: str) -> bool:
+        with self._global_lock:
+            if dedupe_key in self._dedupe:
+                del self._dedupe[dedupe_key]
+                return True
+            return False
+
     def append(
         self,
         incident_id: str,
