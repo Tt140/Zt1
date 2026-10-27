@@ -42,6 +42,10 @@ from .shared import (
 )
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logging.getLogger().setLevel(logging.INFO)
+for _h in logging.getLogger().handlers:
+    _h.setLevel(logging.INFO)
 
 # The agent function — invoked asynchronously after incident creation
 AGENT_FN = os.environ.get("AGENT_FUNCTION", "incidents-agent")
@@ -50,6 +54,42 @@ from typing import Any
 
 # Extract instance_id from alarm name (e.g., DiskUsage-High-i-12345678)
 _INSTANCE_PATTERN = re.compile(r"(i-[0-9a-f]{8,17})", re.IGNORECASE)
+
+
+def _normalize_event(event: Any) -> dict:
+    """
+    Unwraps SNS message wrappers, API Gateway bodies, or stringified payloads into
+    a standard CloudWatch Alarm State Change event dictionary.
+    """
+    if not isinstance(event, dict):
+        return {}
+
+    # Check for SNS wrapper: event["Records"][0]["Sns"]["Message"]
+    records = event.get("Records")
+    if isinstance(records, list) and records:
+        record = records[0]
+        if isinstance(record, dict) and "Sns" in record:
+            msg = record["Sns"].get("Message")
+            if isinstance(msg, str):
+                try:
+                    parsed = json.loads(msg)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
+            elif isinstance(msg, dict):
+                return msg
+
+    # Check for API Gateway / Function URL wrapper: event["body"]
+    if "body" in event and isinstance(event["body"], str):
+        try:
+            parsed = json.loads(event["body"])
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+    return event
 
 
 def _find_instance_in_dimensions(dims: Any) -> str | None:
@@ -125,26 +165,41 @@ def handler(event: dict, context) -> dict:
     Lambda handler for incidents-ingest.
     Triggered by EventBridge on CloudWatch Alarm -> ALARM transition.
     """
+    logger.setLevel(logging.INFO)
+    logging.getLogger().setLevel(logging.INFO)
+
+    raw_event = event or {}
+    logger.info(f"[INGEST-START] Incoming event: {json.dumps(raw_event, default=str)}")
+
     try:
-        detail = event.get("detail", {})
+        norm_event = _normalize_event(raw_event)
+        detail = norm_event.get("detail", {})
         alarm_name  = detail.get("alarmName", "")
         alarm_state = detail.get("state", {}).get("value", "")
-        alarm_arn   = (event.get("resources") or [""])[0]
-        alert_source = event.get("detail-type", "CloudWatch Alarm State Change")
+        alarm_arn   = (norm_event.get("resources") or [""])[0]
+        alert_source = norm_event.get("detail-type", "CloudWatch Alarm State Change")
         description  = detail.get("configuration", {}).get("description", "")
-        region       = event.get("region", AWS_REGION)
+        region       = norm_event.get("region", AWS_REGION)
+
+        logger.info(
+            f"[INGEST-PARSED] alarm_name='{alarm_name}', state='{alarm_state}', "
+            f"alert_source='{alert_source}', region='{region}'"
+        )
 
         if not alarm_name:
+            logger.error(f"[INGEST-ERROR] Missing alarmName in parsed event: {norm_event}")
             return err("missing alarmName in event", 400)
 
         # Ignore non-ALARM states (OK, INSUFFICIENT_DATA)
         if alarm_state != "ALARM":
-            logger.info(f"Skipping alarm state {alarm_state!r} for {alarm_name}")
-            return ok({"skipped": True, "reason": "not ALARM state"})
+            logger.warning(f"[INGEST-SKIP] Skipping alarm '{alarm_name}' with non-ALARM state '{alarm_state}'")
+            return ok({"skipped": True, "reason": f"not ALARM state (state={alarm_state})"})
 
         instance_id = _extract_instance_id(alarm_name, description, detail=detail)
         dedupe_key  = f"alarm::{alarm_name}::{instance_id}"
         incident_id = new_ulid()
+
+        logger.info(f"[INGEST-INSTANCE] Extracted instance_id='{instance_id}', dedupe_key='{dedupe_key}'")
 
         header = IncidentHeader(
             incident_id=incident_id,
@@ -157,29 +212,59 @@ def handler(event: dict, context) -> dict:
         )
 
         store = get_store()
+        logger.info(f"[INGEST-DEDUP] Checking deduplication lock for '{dedupe_key}'...")
         iid, created = store.create_if_absent(dedupe_key, header)
 
         if not created:
             # State-Aware Check: If prior incident was already resolved or escalated,
+            # OR if it is stale (e.g. awaiting_approval past token expiry or abandoned),
             # release stale dedupe_key and open a new incident for this recurring alarm.
+            logger.info(f"[INGEST-DEDUP] Existing incident '{iid}' found for key '{dedupe_key}'. Inspecting prior state...")
             try:
                 events = store.read(iid)
                 if events:
+                    from datetime import datetime
                     from src.domain.reducer import fold
                     from src.domain.types import IncidentPhase
                     prior_state = fold(events)
-                    if prior_state.phase in (IncidentPhase.resolved, IncidentPhase.escalated):
-                        logger.info(
-                            f"Prior incident {iid} is {prior_state.phase.value} — "
-                            f"releasing dedupe key {dedupe_key} and opening fresh incident"
+                    last_ev = events[-1]
+                    now_utc = utc_now()
+
+                    is_stale = False
+                    stale_reason = ""
+                    try:
+                        last_ts = datetime.fromisoformat(last_ev.ts)
+                        age_seconds = (now_utc - last_ts).total_seconds()
+                        if prior_state.phase == IncidentPhase.awaiting_approval and age_seconds > 900:
+                            is_stale = True
+                            stale_reason = f"approval expired ({int(age_seconds)}s > 900s)"
+                        elif prior_state.phase not in (IncidentPhase.resolved, IncidentPhase.escalated) and age_seconds > 1800:
+                            is_stale = True
+                            stale_reason = f"incident abandoned ({int(age_seconds)}s > 1800s without activity)"
+                    except Exception as ts_err:
+                        logger.debug(f"Could not compute incident age: {ts_err}")
+
+                    logger.info(
+                        f"[INGEST-DEDUP-STATE] Prior incident '{iid}' phase is '{prior_state.phase.value}', "
+                        f"events={len(events)}, is_stale={is_stale} ({stale_reason})"
+                    )
+
+                    if prior_state.phase in (IncidentPhase.resolved, IncidentPhase.escalated) or is_stale:
+                        reason = stale_reason if is_stale else prior_state.phase.value
+                        logger.warning(
+                            f"[INGEST-DEDUP-RELEASE] Prior incident {iid} is {reason} — "
+                            f"releasing stale dedupe key '{dedupe_key}' and opening fresh incident"
                         )
                         store.release_dedupe(dedupe_key)
                         iid, created = store.create_if_absent(dedupe_key, header)
             except Exception as e:
-                logger.warning(f"Error checking state of existing incident {iid}: {e}")
+                logger.warning(f"[INGEST-DEDUP-ERROR] Error checking state of existing incident {iid}: {e}", exc_info=True)
 
         if not created:
-            logger.info(f"Duplicate alarm — incident already in progress: {iid}")
+            logger.warning(
+                f"[INGEST-DEDUP-BLOCKED] Duplicate alarm for key '{dedupe_key}'. "
+                f"Incident '{iid}' is actively in progress. Returning HTTP 200 without creating duplicate."
+            )
             return ok({"incident_id": iid, "created": False})
 
         # Persist IncidentOpened event
@@ -196,9 +281,12 @@ def handler(event: dict, context) -> dict:
                 alarm_description=description,
             ),
         )
+        logger.info(f"[INGEST-STORE] Writing IncidentOpened event for incident '{iid}' to DynamoDB...")
         store.append(iid, 0, ev)
+        logger.info(f"[INGEST-STORE] IncidentOpened written successfully for '{iid}'.")
 
         # Notify Slack async: Incident opened
+        logger.info(f"[INGEST-NOTIFY] Dispatching incident notification to '{NOTIFIER_FN}' async...")
         invoke_async(NOTIFIER_FN, {
             "type": "incident_opened",
             "incident_id": iid,
@@ -208,14 +296,15 @@ def handler(event: dict, context) -> dict:
         })
 
         # Invoke agent async
+        logger.info(f"[INGEST-AGENT] Triggering remediation agent '{AGENT_FN}' async for incident '{iid}'...")
         invoke_async(AGENT_FN, {
             "incident_id": iid,
             "instance_id": instance_id,
         })
 
-        logger.info(f"Incident created: {iid} for alarm {alarm_name}")
+        logger.info(f"[INGEST-SUCCESS] Incident {iid} created and agent launched successfully for alarm '{alarm_name}'.")
         return ok({"incident_id": iid, "created": True})
 
     except Exception as exc:
-        logger.exception(f"ingest handler error: {exc}")
+        logger.exception(f"[INGEST-FATAL] Ingest handler unhandled exception: {exc}")
         return err(str(exc))

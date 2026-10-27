@@ -297,3 +297,78 @@ class TestIngestAlarmNameParsing:
         assert mock_inv.call_count == 2
         agent_call = next(call for call in mock_inv.call_args_list if call[0][0] == mod.AGENT_FN)
         assert agent_call[0][1]["instance_id"] == "i-0a1b2c3d4e5f6789"
+
+    def test_handler_unwraps_sns_message(self):
+        """Handler should unwrap SNS message envelope automatically."""
+        from handlers import ingest as mod
+        from src.store.memory import MemoryEventStore
+        from unittest.mock import patch
+        import json
+
+        store = MemoryEventStore()
+        cw_event = _alarm_event("High-CPU-i-0a79ecfae5d7cec1a")
+        sns_event = {
+            "Records": [
+                {
+                    "EventSource": "aws:sns",
+                    "Sns": {
+                        "Message": json.dumps(cw_event),
+                    }
+                }
+            ]
+        }
+        with patch.object(mod, "get_store", return_value=store), \
+             patch.object(mod, "invoke_async") as mock_inv:
+            resp = mod.handler(sns_event, context=None)
+
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["created"] is True
+        iid = body["incident_id"]
+        assert store.get_header(iid).instance_id == "i-0a79ecfae5d7cec1a"
+
+    def test_state_aware_dedup_releases_stale_approval(self):
+        """When prior incident has an expired approval (> 15 min), a new alarm opens fresh incident."""
+        from datetime import datetime, timezone, timedelta
+        from handlers import ingest as mod
+        from src.store.memory import MemoryEventStore
+        from src.domain.types import (
+            build_event, EventType, Actor, PolicyDecisionPayload,
+            PolicyDecisionValue, Tier,
+        )
+        from unittest.mock import patch
+        import json
+
+        store = MemoryEventStore()
+        with patch.object(mod, "get_store", return_value=store), \
+             patch.object(mod, "invoke_async"):
+            # 1. Incident 1 opened
+            r1 = mod.handler(_alarm_event(), context=None)
+            iid1 = json.loads(r1["body"])["incident_id"]
+
+            # 2. Add PolicyDecision requiring approval from 20 minutes ago
+            stale_time = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+            ev_policy = build_event(
+                incident_id=iid1,
+                type=EventType.PolicyDecision,
+                actor=Actor.agent,
+                payload=PolicyDecisionPayload(
+                    step_id="step-1",
+                    plan_hash="h1",
+                    tier=Tier.T2,
+                    decision=PolicyDecisionValue.require_approval,
+                    reasons=["T2 approval required"],
+                    rule_ids=["T2-APPROVAL"],
+                    budget_snapshot={},
+                    gate_version="1.0",
+                ),
+            )
+            ev_policy.ts = stale_time
+            store.append(iid1, 1, ev_policy)
+
+            # 3. New alarm arrives -> state-aware dedup detects stale approval (> 15 min),
+            # releases key and opens fresh incident
+            r2 = mod.handler(_alarm_event(), context=None)
+            b2 = json.loads(r2["body"])
+            assert b2["created"] is True
+            assert b2["incident_id"] != iid1

@@ -16,7 +16,10 @@ import boto3
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logger.setLevel(logging.INFO)
+logging.getLogger().setLevel(logging.INFO)
+for _h in logging.getLogger().handlers:
+    _h.setLevel(logging.INFO)
 
 
 # ── config ───────────────────────────────────────────────────────────────────
@@ -345,12 +348,14 @@ def get_lambda_client():
 def invoke_async(function_name: str, payload: dict) -> None:
     """Invokes Lambda asynchronously without waiting for response."""
     client = get_lambda_client()
-    client.invoke(
+    logger.info(f"[INVOKE-ASYNC] Invoking function '{function_name}' asynchronously (InvocationType='Event')")
+    resp = client.invoke(
         FunctionName=function_name,
         InvocationType="Event",       # async
         Payload=json.dumps(payload).encode(),
     )
-    logger.info(f"Invoked {function_name} async")
+    status_code = resp.get("StatusCode")
+    logger.info(f"[INVOKE-ASYNC] Successfully dispatched '{function_name}' (StatusCode={status_code})")
 
 
 def ok(body: dict, status: int = 200) -> dict:
