@@ -909,6 +909,30 @@ def run_full_audit(
 
 # ── Delta & Parameters Calculation Engine ────────────────────────────────────
 
+def detect_lambda_python_runtime(override: Optional[str] = None) -> str:
+    """
+    Determines the optimal AWS Lambda Python runtime.
+    Priority:
+    1. Explicit override (if provided and valid).
+    2. Current Python execution environment (sys.version_info).
+    3. Safe default (python3.12).
+    """
+    if override and str(override).strip():
+        cand = str(override).strip().lower()
+        if cand in ("python3.10", "python3.11", "python3.12"):
+            return cand
+        if cand in ("3.10", "3.11", "3.12"):
+            return f"python{cand}"
+    major, minor = sys.version_info[0], sys.version_info[1]
+    if (major, minor) == (3, 11):
+        return "python3.11"
+    elif (major, minor) == (3, 10):
+        return "python3.10"
+    elif (major, minor) >= (3, 12):
+        return "python3.12"
+    return "python3.12"
+
+
 def build_cfn_parameters(
     report: AuditReport,
     strands_override: Optional[str] = None,
@@ -917,6 +941,7 @@ def build_cfn_parameters(
     existing_bucket: Optional[str] = None,
     is_apply: bool = False,
     injected_params: Optional[Dict[str, str]] = None,
+    python_runtime: Optional[str] = None,
 ) -> Tuple[Dict[str, str], List[str], str]:
     """
     Computes exact parameter overrides for template.yaml based on audit discovery,
@@ -924,6 +949,12 @@ def build_cfn_parameters(
     """
     params: Dict[str, str] = {}
     pre_actions: List[str] = []
+
+    # 0. Python Runtime for Lambda Functions (dynamic & auto-adapting)
+    resolved_runtime = detect_lambda_python_runtime(
+        python_runtime or (injected_params.get("PYTHON_RUNTIME") if injected_params else None)
+    )
+    params["PythonRuntime"] = resolved_runtime
 
     # 1. Target Instance ID
     if create_target_vps:
@@ -1143,6 +1174,7 @@ def split_env_vars(env_vars: Dict[str, str]) -> Tuple[Dict[str, str], Dict[str, 
         "STRANDS_URL",
         "SLACK_AUTHORIZED_APPROVERS",
         "SLACK_CHANNEL",
+        "PYTHON_RUNTIME",
     }
 
     injected_secrets = {k: v for k, v in env_vars.items() if k in secrets_keys and v.strip()}
@@ -2827,6 +2859,7 @@ def run_apply_mode(
         create_target_vps=create_vps and not target_id,
         is_apply=True,
         injected_params=injected_params,
+        python_runtime=getattr(args, "python_runtime", "").strip() or None,
     )
     print_plan(report, params, pre_actions, sam_command)
 
@@ -2943,6 +2976,7 @@ def run_apply_mode(
         existing_bucket=getattr(args, "existing_bucket", "").strip() or None,
         is_apply=True,
         injected_params=injected_params,
+        python_runtime=getattr(args, "python_runtime", "").strip() or None,
     )
 
     # 4. SAM deployment
@@ -2967,8 +3001,16 @@ def run_apply_mode(
                 ensure_clean_stack_before_deploy(session=session, stack_name=args.stack_name, region=region)
 
                 # Build
-                print("  -> Running: sam build")
-                b_res = subprocess.run(["sam", "build"], cwd=project_root, capture_output=True, text=True)
+                runtime_val = params.get("PythonRuntime") or detect_lambda_python_runtime(getattr(args, "python_runtime", ""))
+                build_cmd = ["sam", "build", "--parameter-overrides", f"PythonRuntime={runtime_val}"]
+                print(f"  -> Running: {' '.join(build_cmd)}")
+                b_res = subprocess.run(build_cmd, cwd=project_root, capture_output=True, text=True)
+                if b_res.returncode != 0 and shutil.which("docker"):
+                    print("  ⚠️ Local pip build encountered an issue. Attempting containerized build via 'sam build --use-container'...")
+                    container_cmd = ["sam", "build", "--use-container", "--parameter-overrides", f"PythonRuntime={runtime_val}"]
+                    print(f"  -> Running: {' '.join(container_cmd)}")
+                    b_res = subprocess.run(container_cmd, cwd=project_root, capture_output=True, text=True)
+
                 if b_res.returncode != 0:
                     print(f"  ❌ sam build failed:\n{b_res.stderr}")
                     deploy_status = "BUILD_FAILED"
@@ -3007,7 +3049,21 @@ def run_apply_mode(
                 deploy_msg = str(e)
                 print(f"  ❌ Deployment error: {e}")
 
-    # 5. Print Final Receipt
+    # 5. Extract SlackCallbackUrl from Stack Outputs if deployed
+    slack_callback_url = ""
+    if deploy_status == "DEPLOYED":
+        try:
+            cfn = session.client("cloudformation", region_name=region)
+            st_resp = cfn.describe_stacks(StackName=args.stack_name)
+            if st_resp.get("Stacks"):
+                for out in st_resp["Stacks"][0].get("Outputs", []):
+                    if out.get("OutputKey") == "SlackCallbackUrl":
+                        slack_callback_url = out.get("OutputValue", "")
+                        break
+        except Exception:
+            pass
+
+    # 6. Print Final Receipt
     json_out_file = args.json_out or "onboarding_report.json"
     print("\n" + "=" * 80)
     print("🎉 FINAL ONBOARDING RECEIPT")
@@ -3016,6 +3072,9 @@ def run_apply_mode(
     print(f"  Target Status:             {'Online in SSM, Tagged' if report.ec2.target_valid else 'Issues detected'}")
     print(f"  Pre-Deploy Actions Taken:  {len(executed_actions)}")
     print(f"  Serverless Stack:          {args.stack_name} [{deploy_status}]")
+    if slack_callback_url:
+        print(f"  Slack Interactivity URL:   {slack_callback_url}")
+        print("  👉 Next Step: Configure this URL in Slack App → Interactivity & Shortcuts → Request URL")
     print(f"  Receipt Artifact:          {json_out_file}")
     if args.env_out:
         print(f"  Environment Configuration: {args.env_out}")
@@ -3406,6 +3465,11 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Override URL for Strands Decider service (e.g. http://<ip>:8080 or embedded)",
     )
     parser.add_argument(
+        "--python-runtime",
+        default="",
+        help="Target Python runtime for Lambda functions (e.g. python3.11, python3.12). If omitted, automatically detected from current Python environment.",
+    )
+    parser.add_argument(
         "--yes",
         action="store_true",
         help="Automatically approve and proceed with applying changes without interactive confirmation",
@@ -3482,6 +3546,7 @@ def main():
             create_target_vps=args.create_target_vps,
             existing_bucket=args.existing_bucket.strip() or None,
             injected_params=injected_params,
+            python_runtime=getattr(args, "python_runtime", "").strip() or None,
         )
         print_plan(report, params, pre_actions, sam_command)
 

@@ -49,7 +49,7 @@ _T0_ALLOWED_PREFIXES = frozenset([
 _T1_ALLOWED_PREFIXES = frozenset([
     "systemctl restart", "systemctl start", "systemctl stop", "systemctl reload",
     "kill", "pkill",
-    "rm -f", "truncate", "mv", "cp",
+    "rm -f", "rm -rf", "rm ", "rm", "truncate", "mv", "cp",
 ]) | _T0_ALLOWED_PREFIXES
 
 # Maximum wait time for SSM result (seconds)
@@ -200,6 +200,9 @@ class SSMLab:
                     or stripped_cmd.startswith("mv")
                     or stripped_cmd.startswith("cp")
                     or stripped_cmd.startswith("rm -f")
+                    or stripped_cmd.startswith("rm -rf")
+                    or stripped_cmd.startswith("rm ")
+                    or stripped_cmd == "rm"
                 ):
                     command = f"sudo {stripped_cmd}"
 

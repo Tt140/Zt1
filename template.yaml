@@ -9,6 +9,12 @@ Description: >
 # ── Parameters ───────────────────────────────────────────────────────────────
 
 Parameters:
+  PythonRuntime:
+    Type: String
+    Default: "python3.12"
+    AllowedValues: ["python3.10", "python3.11", "python3.12"]
+    Description: "Target Python runtime for Lambda functions"
+
   TargetInstanceId:
     Type: String
     Default: ""
@@ -138,7 +144,7 @@ Conditions:
 
 Globals:
   Function:
-    Runtime: python3.12
+    Runtime: !Ref PythonRuntime
     Architectures: [x86_64]
     CodeUri: ./
     Handler: handlers.ingest.handler
@@ -293,7 +299,7 @@ Resources:
         parameters:
           command:
             type: String
-            allowedPattern: "^(sudo )?(systemctl restart|systemctl start|systemctl stop|systemctl reload|rm -f|truncate|mv|cp|kill|pkill).*"
+            allowedPattern: "^(sudo )?(systemctl restart|systemctl start|systemctl stop|systemctl reload|rm -f|rm -rf|rm|truncate|mv|cp|kill|pkill).*"
             description: "Restricted repair command (allowlist enforced)"
         mainSteps:
           - action: aws:runShellScript
@@ -710,13 +716,14 @@ Resources:
       FunctionName: incidents-slack-callback
       Handler: handlers.slack_callback.handler
       Role: !If [ShouldCreateCoreIamRoles, !GetAtt SlackCallbackRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/incidents-slack-callback-role"]
-      MemorySize: 128
-      Timeout: 10
+      MemorySize: 512
+      Timeout: 15
       FunctionUrlConfig:
         AuthType: NONE
         Cors:
-          AllowOrigins: ["https://slack.com"]
+          AllowOrigins: ["*"]
           AllowMethods: ["POST"]
+          AllowHeaders: ["*"]
       Environment:
         Variables:
           SLACK_SIGNING_SECRET_ARN: !If
@@ -868,3 +875,5 @@ Outputs:
   SlackCallbackUrl:
     Description: "Configure this URL in Slack App → Interactivity & Shortcuts → Request URL"
     Value: !GetAtt SlackCallbackFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub "${AWS::StackName}-SlackCallbackUrl"

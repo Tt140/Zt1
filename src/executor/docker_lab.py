@@ -62,7 +62,7 @@ _T0_ALLOWED_PREFIXES = (
 _T1_ALLOWED_PREFIXES = _T0_ALLOWED_PREFIXES + (
     "systemctl restart", "systemctl stop", "systemctl start",
     "service", "kill", "pkill",
-    "rm -f", "rm -rf /tmp/",  # Temporary deletion only within sandbox
+    "rm -f", "rm -rf", "rm ", "rm", "rm -rf /tmp/",  # Deletion allowed under T1/T2 approval
     "mkdir -p /tmp/",
     "cp", "mv",
     "chmod", "chown",

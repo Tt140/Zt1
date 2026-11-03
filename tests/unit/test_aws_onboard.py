@@ -2136,6 +2136,48 @@ class TestSsmDocumentsReconciliation:
         mock_ssm.create_document.assert_not_called()
         mock_ssm.update_document.assert_not_called()
 
+    def test_detect_lambda_python_runtime_and_build_cfn_parameters(self):
+        from scripts.aws_onboard import detect_lambda_python_runtime, build_cfn_parameters
+        from unittest.mock import patch
+        import sys
+
+        # Test explicit overrides
+        assert detect_lambda_python_runtime("python3.11") == "python3.11"
+        assert detect_lambda_python_runtime("3.11") == "python3.11"
+        assert detect_lambda_python_runtime("python3.10") == "python3.10"
+        assert detect_lambda_python_runtime("3.12") == "python3.12"
+        assert detect_lambda_python_runtime("invalid") == "python3.12"
+
+        # Test sys.version_info mocking
+        with patch.object(sys, "version_info", (3, 11, 5, "final", 0)):
+            assert detect_lambda_python_runtime() == "python3.11"
+
+        with patch.object(sys, "version_info", (3, 10, 12, "final", 0)):
+            assert detect_lambda_python_runtime() == "python3.10"
+
+        with patch.object(sys, "version_info", (3, 12, 3, "final", 0)):
+            assert detect_lambda_python_runtime() == "python3.12"
+
+        with patch.object(sys, "version_info", (3, 13, 0, "final", 0)):
+            assert detect_lambda_python_runtime() == "python3.12"
+
+        # Test build_cfn_parameters includes PythonRuntime
+        report = AuditReport(
+            identity=_make_identity(),
+            ec2=_make_ec2_report(),
+            dynamodb=_make_dynamodb_report(),
+            s3=_make_s3_report(),
+            ssm=_make_ssm_report(),
+            iam=_make_iam_report(),
+            secrets=_make_secrets_report(),
+            stack=_make_stack_report(),
+            overall_status="READY",
+        )
+        params, _, sam_cmd = build_cfn_parameters(report, python_runtime="python3.11")
+        assert params["PythonRuntime"] == "python3.11"
+        assert "PythonRuntime=python3.11" in sam_cmd
+
+
 
 
 

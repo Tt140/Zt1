@@ -193,6 +193,16 @@ class TestSSMLabAllowlistAndAutoSudo:
         called_cmd = mock_ssm.send_command.call_args[1]["Parameters"]["command"][0]
         assert called_cmd.startswith("sudo rm -f ")
 
+        # Test rm without flags
+        lab.run("rm /var/log/app_old.log", tier="T1")
+        called_cmd = mock_ssm.send_command.call_args[1]["Parameters"]["command"][0]
+        assert called_cmd.startswith("sudo rm /")
+
+        # Test rm -rf
+        lab.run("rm -rf /tmp/stale_cache", tier="T1")
+        called_cmd = mock_ssm.send_command.call_args[1]["Parameters"]["command"][0]
+        assert called_cmd.startswith("sudo rm -rf ")
+
     def test_existing_sudo_not_duplicated(self):
         """Commands that already start with sudo should not have a second sudo added."""
         mock_ssm = MagicMock()
