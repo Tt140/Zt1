@@ -101,6 +101,12 @@ Parameters:
     Default: ""
     Description: "ARN of Secrets Manager secret: /incidents/slack-signing-secret"
 
+  SlackSigningSecret:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: "Slack signing secret for verifying interactive callbacks"
+
   ApprovalMacKeyHex:
     Type: String
     Default: ""
@@ -726,6 +732,7 @@ Resources:
           AllowHeaders: ["*"]
       Environment:
         Variables:
+          SLACK_SIGNING_SECRET:                  !Ref SlackSigningSecret
           SLACK_SIGNING_SECRET_ARN: !If
             - HasSlackSigningSecret
             - !Ref SlackSigningSecretArn

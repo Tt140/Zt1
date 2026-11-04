@@ -996,6 +996,7 @@ def build_cfn_parameters(
     existing_bucket: Optional[str] = None,
     is_apply: bool = False,
     injected_params: Optional[Dict[str, str]] = None,
+    injected_secrets: Optional[Dict[str, str]] = None,
     python_runtime: Optional[str] = None,
 ) -> Tuple[Dict[str, str], List[str], str]:
     """
@@ -1075,6 +1076,12 @@ def build_cfn_parameters(
             params["SlackAuthorizedApprovers"] = injected_params["SLACK_AUTHORIZED_APPROVERS"]
         if "SLACK_CHANNEL" in injected_params:
             params["SlackChannel"] = injected_params["SLACK_CHANNEL"]
+        if "SLACK_SIGNING_SECRET" in injected_params:
+            params["SlackSigningSecret"] = injected_params["SLACK_SIGNING_SECRET"]
+
+    if injected_secrets:
+        if "SLACK_SIGNING_SECRET" in injected_secrets:
+            params["SlackSigningSecret"] = injected_secrets["SLACK_SIGNING_SECRET"]
 
     # 4. DynamoDB Tables
     if report.dynamodb.all_ready:
@@ -1219,6 +1226,7 @@ def split_env_vars(env_vars: Dict[str, str]) -> Tuple[Dict[str, str], Dict[str, 
         "SLACK_WEBHOOK_URL",
         "SLACK_APP_TOKEN",
         "SLACK_REFRESH_TOKEN",
+        "SLACK_SIGNING_SECRET",
     }
     params_keys = {
         "DEEPSEEK_BASE_URL",
@@ -1229,6 +1237,7 @@ def split_env_vars(env_vars: Dict[str, str]) -> Tuple[Dict[str, str], Dict[str, 
         "STRANDS_URL",
         "SLACK_AUTHORIZED_APPROVERS",
         "SLACK_CHANNEL",
+        "SLACK_SIGNING_SECRET",
         "PYTHON_RUNTIME",
     }
 
@@ -1359,6 +1368,7 @@ def ensure_client_secrets(
         ("SLACK_WEBHOOK_URL", "/incidents/slack-webhook-url", "Slack Webhook URL for incident notifications"),
         ("SLACK_APP_TOKEN", "/incidents/slack-app-token", "Slack App-level token for Socket Mode"),
         ("SLACK_REFRESH_TOKEN", "/incidents/slack-refresh-token", "Slack refresh token for token rotation"),
+        ("SLACK_SIGNING_SECRET", "/incidents/slack-signing-secret", "Slack signing secret for interactive callback signature verification"),
     ]
     for env_k, sec_name, sec_desc in optional_secret_mappings:
         s_val = injected.get(env_k, "").strip()
@@ -2914,6 +2924,7 @@ def run_apply_mode(
         create_target_vps=create_vps and not target_id,
         is_apply=True,
         injected_params=injected_params,
+        injected_secrets=injected_secrets,
         python_runtime=getattr(args, "python_runtime", "").strip() or None,
     )
     print_plan(report, params, pre_actions, sam_command)
@@ -3031,6 +3042,7 @@ def run_apply_mode(
         existing_bucket=getattr(args, "existing_bucket", "").strip() or None,
         is_apply=True,
         injected_params=injected_params,
+        injected_secrets=injected_secrets,
         python_runtime=getattr(args, "python_runtime", "").strip() or None,
     )
 
@@ -3601,6 +3613,7 @@ def main():
             create_target_vps=args.create_target_vps,
             existing_bucket=args.existing_bucket.strip() or None,
             injected_params=injected_params,
+            injected_secrets=injected_secrets,
             python_runtime=getattr(args, "python_runtime", "").strip() or None,
         )
         print_plan(report, params, pre_actions, sam_command)

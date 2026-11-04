@@ -1118,7 +1118,7 @@ class TestAwsOnboardPlanner:
         with open(onboard_script, "r", encoding="utf-8") as f:
             content = f.read()
         assert "slack-bot-token" not in content, "Legacy secret 'slack-bot-token' found in scripts/aws_onboard.py"
-        assert "slack-signing-secret" not in content, "Legacy secret 'slack-signing-secret' found in scripts/aws_onboard.py"
+        assert "/incidents/slack-signing-secret" in content, "Optional secret 'slack-signing-secret' must be supported for interactive callbacks"
 
         # 3. pre_actions immunity: missing slack webhook must NEVER trigger a pre_action requirement
         ident = _make_identity()
@@ -2007,6 +2007,44 @@ class TestEnvFileInjection:
             SecretString="bedrock-live-token-999",
         )
         assert any("Updated secret '/incidents/deepseek-api-key' with live credential" in r for r in results)
+
+    def test_split_env_vars_and_secrets_manager_slack_signing_secret(self):
+        raw = {
+            "SLACK_SIGNING_SECRET": "d66c14f5672ce57c54f3b250f0b29d63",
+            "SLACK_APP_TOKEN": "xapp-12345",
+        }
+        secrets, params = split_env_vars(raw)
+        assert secrets["SLACK_SIGNING_SECRET"] == "d66c14f5672ce57c54f3b250f0b29d63"
+        assert params["SLACK_SIGNING_SECRET"] == "d66c14f5672ce57c54f3b250f0b29d63"
+
+        # Test ensure_client_secrets creates /incidents/slack-signing-secret
+        mock_session = MagicMock()
+        mock_sm = MagicMock()
+        mock_session.client.return_value = mock_sm
+        mock_session.region_name = "us-east-1"
+        from botocore.exceptions import ClientError
+        mock_sm.describe_secret.side_effect = ClientError({"Error": {"Code": "ResourceNotFoundException"}}, "DescribeSecret")
+
+        results = ensure_client_secrets(mock_session, injected_secrets=secrets)
+        mock_sm.create_secret.assert_any_call(
+            Name="/incidents/slack-signing-secret",
+            Description="Slack signing secret for interactive callback signature verification",
+            SecretString="d66c14f5672ce57c54f3b250f0b29d63",
+        )
+        assert any("Created secret '/incidents/slack-signing-secret'" in r for r in results)
+
+        # Test build_cfn_parameters injects SlackSigningSecret parameter
+        ident = _make_identity()
+        ec2 = _make_ec2_report(has_security_tag=True)
+        report = AuditReport(
+            identity=ident, ec2=ec2, dynamodb=_make_dynamodb_report(all_ready=True),
+            s3=_make_s3_report(exists=True), ssm=_make_ssm_report(all_ready=True),
+            iam=_make_iam_report(all_ready=True), secrets=_make_secrets_report(all_exist=True),
+            stack=_make_stack_report(), overall_status="READY",
+        )
+        cfn_params, _, sam_cmd = build_cfn_parameters(report, injected_secrets=secrets)
+        assert cfn_params["SlackSigningSecret"] == "d66c14f5672ce57c54f3b250f0b29d63"
+        assert "SlackSigningSecret=d66c14f5672ce57c54f3b250f0b29d63" in sam_cmd
 
     def test_cli_parser_env_file_flag(self):
         # Default with -E
