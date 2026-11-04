@@ -191,15 +191,81 @@ def _handle_slash_command(form_data: dict) -> dict:
         except Exception as e:
             logger.error(f"Failed to invoke agent after slash approval: {e}")
 
-    status_text = "✅ Approved" if is_approve else "❌ Denied"
+    status_text = (
+        f"✅ Approved & Executing step `{step_id}` for incident `{incident_id}` by <@{user_id}>"
+        if is_approve
+        else f"❌ Denied step `{step_id}` for incident `{incident_id}` by <@{user_id}>"
+    )
     return {
         "statusCode": 200,
         "headers": {"Content-Type": "application/json"},
         "body": json.dumps({
             "response_type": "in_channel",
-            "text": f"{status_text} step `{step_id}` for incident `{incident_id}` by <@{user_id}>",
+            "text": status_text,
         }),
     }
+
+
+def _build_updated_slack_blocks(
+    original_blocks: list[dict],
+    is_approve: bool,
+    step_id: str,
+    incident_id: str,
+    user_id: str,
+) -> tuple[str, list[dict]]:
+    """
+    Replaces the interactive action buttons block with an in-place confirmation context block
+    to prevent double-clicks and provide immediate visual UX feedback in Slack.
+    """
+    clean_user = user_id.strip("<@> ").strip()
+    if is_approve:
+        status_text = f"✅ Approved & Executing step {step_id} for incident {incident_id} by <@{clean_user}>"
+        status_mrkdwn = f"✅ *Approved & Executing* step `{step_id}` for incident `{incident_id}` by <@{clean_user}>"
+    else:
+        status_text = f"❌ Denied step {step_id} for incident {incident_id} by <@{clean_user}>"
+        status_mrkdwn = f"❌ *Denied* step `{step_id}` for incident `{incident_id}` by <@{clean_user}>"
+
+    status_block = {
+        "type": "context",
+        "block_id": "approval_status",
+        "elements": [
+            {
+                "type": "mrkdwn",
+                "text": status_mrkdwn,
+            }
+        ],
+    }
+
+    if not original_blocks:
+        # Fallback if original message blocks were not supplied in payload
+        updated_blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"🔐 *Incident `{incident_id}`* — Step `{step_id}`",
+                },
+            },
+            status_block,
+        ]
+        return status_text, updated_blocks
+
+    updated_blocks = []
+    replaced = False
+    for block in original_blocks:
+        b_type = block.get("type", "")
+        b_id = block.get("block_id", "")
+        if b_type == "actions" or b_id == "approval_actions":
+            # Replace the action buttons in-place with the status context block
+            updated_blocks.append(status_block)
+            replaced = True
+        else:
+            updated_blocks.append(block)
+
+    if not replaced:
+        updated_blocks.append(status_block)
+
+    return status_text, updated_blocks
 
 
 def _handle_block_action(payload: dict) -> dict:
@@ -273,15 +339,24 @@ def _handle_block_action(payload: dict) -> dict:
         except Exception as e:
             logger.error(f"Failed to invoke agent after approval: {e}")
 
-    # Respond to Slack immediately (< 3 seconds)
-    status_text = "✅ Approved" if is_approve else "❌ Denied"
+    # Build updated Slack blocks (removing action buttons and adding confirmation context block)
+    original_blocks = payload.get("message", {}).get("blocks", [])
+    status_text, updated_blocks = _build_updated_slack_blocks(
+        original_blocks=original_blocks,
+        is_approve=is_approve,
+        step_id=step_id,
+        incident_id=incident_id,
+        user_id=approver,
+    )
+
     return {
         "statusCode": 200,
         "headers": {"Content-Type": "application/json"},
         "body": json.dumps({
             "response_type": "in_channel",
             "replace_original": True,
-            "text": f"{status_text} by <@{approver}>",
+            "text": status_text,
+            "blocks": updated_blocks,
         }),
     }
 

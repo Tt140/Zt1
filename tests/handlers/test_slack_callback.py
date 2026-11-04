@@ -153,9 +153,25 @@ class TestSlackSignatureVerification:
 
 class TestSlackCallbackActions:
 
-    def _call(self, store, action_id: str, incident_id: str, step_id: str, user_id: str = "U123456"):
+    def _call(
+        self,
+        store,
+        action_id: str,
+        incident_id: str,
+        step_id: str,
+        user_id: str = "U123456",
+        message_blocks: Optional[list] = None,
+    ):
         from handlers import slack_callback as mod
-        body = _make_block_action(action_id, incident_id, step_id, user_id=user_id)
+        value = json.dumps({"incident_id": incident_id, "step_id": step_id})
+        payload = {
+            "type": "block_actions",
+            "user": {"id": user_id},
+            "actions": [{"action_id": action_id, "value": value}],
+        }
+        if message_blocks is not None:
+            payload["message"] = {"blocks": message_blocks}
+        body = urllib.parse.urlencode({"payload": json.dumps(payload)}).encode()
         event = {
             "headers": _sign(body),
             "body": body.decode(),
@@ -218,6 +234,91 @@ class TestSlackCallbackActions:
         resp, _ = self._call(store, "approve", iid, new_ulid(), user_id="U123456")
         body = json.loads(resp["body"])
         assert "Approved" in body.get("text", "")
+
+    def test_approve_replaces_action_buttons_with_status_context_block(self):
+        """
+        When human approves via Slack interactive button:
+        1. actions block (Approve/Deny buttons) is completely removed.
+        2. In-place context block is added with '✅ Approved & Executing step {step_id} for incident {incident_id} by <@{user_id}>'.
+        3. replace_original is True.
+        """
+        store = MemoryEventStore()
+        iid = _make_incident(store)
+        step_id = new_ulid()
+        orig_blocks = [
+            {"type": "header", "text": {"type": "plain_text", "text": "Approval Required"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "Proposed remediation action"}},
+            {"type": "actions", "block_id": "approval_actions", "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "Approve"}, "action_id": "approve"},
+                {"type": "button", "text": {"type": "plain_text", "text": "Deny"}, "action_id": "deny"},
+            ]},
+        ]
+        resp, mock_inv = self._call(store, "approve", iid, step_id, user_id="U123456", message_blocks=orig_blocks)
+
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body.get("replace_original") is True
+        assert body.get("response_type") == "in_channel"
+
+        blocks = body.get("blocks", [])
+        assert len(blocks) == 3
+        # Ensure actions block was completely removed
+        assert not any(b.get("type") == "actions" for b in blocks)
+        assert not any(b.get("block_id") == "approval_actions" for b in blocks)
+
+        # Ensure context block replaced it with exact format
+        status_block = blocks[2]
+        assert status_block.get("type") == "context"
+        mrkdwn_text = status_block["elements"][0]["text"]
+        assert f"✅ *Approved & Executing* step `{step_id}` for incident `{iid}` by <@U123456>" == mrkdwn_text
+        assert f"✅ Approved & Executing step {step_id} for incident {iid} by <@U123456>" == body.get("text")
+
+    def test_deny_replaces_action_buttons_with_denied_context_block(self):
+        """When human denies step, actions block is replaced by a denied context block."""
+        store = MemoryEventStore()
+        iid = _make_incident(store)
+        step_id = new_ulid()
+        orig_blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": "Action"}},
+            {"type": "actions", "block_id": "approval_actions", "elements": []},
+        ]
+        resp, _ = self._call(store, "deny", iid, step_id, user_id="U123456", message_blocks=orig_blocks)
+
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body.get("replace_original") is True
+        blocks = body.get("blocks", [])
+        assert not any(b.get("type") == "actions" for b in blocks)
+        context_block = blocks[-1]
+        assert context_block.get("type") == "context"
+        assert f"❌ *Denied* step `{step_id}` for incident `{iid}` by <@U123456>" in context_block["elements"][0]["text"]
+
+    def test_duplicate_click_returns_error_and_does_not_mutate(self):
+        """
+        When a user clicks approve a second time, the callback rejects it
+        with an ephemeral error message and does not duplicate the approval.
+        """
+        store = MemoryEventStore()
+        iid = _make_incident(store)
+        step_id = new_ulid()
+        orig_blocks = [
+            {"type": "actions", "block_id": "approval_actions", "elements": []},
+        ]
+        # First click: successfully records approval and replaces blocks
+        resp1, _ = self._call(store, "approve", iid, step_id, user_id="U123456", message_blocks=orig_blocks)
+        assert resp1["statusCode"] == 200
+        body1 = json.loads(resp1["body"])
+        assert body1.get("replace_original") is True
+        assert "Approved & Executing" in body1.get("text", "")
+
+        # Second click (double click): rejects as already decided
+        resp2, _ = self._call(store, "approve", iid, step_id, user_id="U123456", message_blocks=orig_blocks)
+        assert resp2["statusCode"] == 200
+        body2 = json.loads(resp2["body"])
+        assert body2.get("replace_original") is False
+        assert body2.get("response_type") == "ephemeral"
+        assert "Error recording approval" in body2.get("text", "")
+        assert "cannot reuse" in body2.get("text", "")
 
     def test_unauthorized_user_approval_rejected_ephemeral(self):
         """
