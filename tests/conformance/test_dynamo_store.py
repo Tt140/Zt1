@@ -9,6 +9,11 @@ Does not require active AWS credentials or connection.
 import os
 import pytest
 import boto3
+
+pytest.importorskip(
+    "moto",
+    reason="moto is required for local DynamoDB conformance tests (install via: pip install -r requirements-dev.txt)",
+)
 from moto import mock_aws
 
 from src.store.dynamo_store import DynamoEventStore

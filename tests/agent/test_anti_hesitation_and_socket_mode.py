@@ -148,6 +148,17 @@ class TestAntiHesitation(unittest.TestCase):
         self.assertIn("systemctl restart my-service", res.tool_calls[0].arguments.get("command", ""))
 
 
+try:
+    import slack_sdk  # noqa: F401
+    _HAS_SLACK_SDK = True
+except ImportError:
+    _HAS_SLACK_SDK = False
+
+
+@unittest.skipUnless(
+    _HAS_SLACK_SDK,
+    "slack_sdk is required for Socket Mode tests (install via: pip install -r requirements-dev.txt)",
+)
 class TestSlackSocketModeApproval(unittest.TestCase):
     @patch("slack_sdk.web.WebClient")
     @patch("slack_sdk.socket_mode.SocketModeClient")
