@@ -644,6 +644,61 @@ def extract_cfn_failure_root_causes(
     return failures
 
 
+def ensure_sam_cli() -> Optional[str]:
+    """
+    Ensures that the AWS SAM CLI executable ('sam') is available.
+    If not found on system PATH:
+    1. Checks the current Python environment's bin/Scripts directory.
+    2. Automatically bootstraps and installs 'aws-sam-cli' via sys.executable -m pip for zero-touch onboarding.
+    Returns the absolute path or command name for the 'sam' executable if available, or None.
+    """
+    sam_cli = shutil.which("sam")
+    if sam_cli:
+        return sam_cli
+
+    # Check next to current Python interpreter (e.g. .venv/bin/sam or Scripts/sam.exe)
+    py_dir = os.path.dirname(sys.executable)
+    candidate = os.path.join(py_dir, "sam")
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        os.environ["PATH"] = f"{py_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+        return candidate
+    candidate_exe = os.path.join(py_dir, "sam.exe")
+    if os.path.isfile(candidate_exe) and os.access(candidate_exe, os.X_OK):
+        os.environ["PATH"] = f"{py_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+        return candidate_exe
+
+    # If running inside pytest or automated test harness, avoid initiating real pip install
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+
+    # Zero-touch auto-bootstrap via pip install aws-sam-cli
+    print("\n⚙️ 'sam' CLI was not found in PATH. Automatically bootstrapping aws-sam-cli for zero-touch deployment...")
+    print("  ⏳ Installing aws-sam-cli via pip (zero manual steps required)...")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "aws-sam-cli"],
+            capture_output=True,
+            text=True,
+        )
+        sam_cli = shutil.which("sam")
+        if not sam_cli:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                sam_cli = candidate
+                os.environ["PATH"] = f"{py_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+            elif os.path.isfile(candidate_exe) and os.access(candidate_exe, os.X_OK):
+                sam_cli = candidate_exe
+                os.environ["PATH"] = f"{py_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+        if sam_cli:
+            print("  ✅ aws-sam-cli successfully installed and available!")
+            return sam_cli
+        else:
+            print(f"  ⚠️ Auto-installation finished but 'sam' executable was not found. Output: {proc.stderr[:200]}")
+    except Exception as exc:
+        print(f"  ⚠️ Auto-installation encountered error: {exc}")
+
+    return None
+
+
 def ensure_clean_stack_before_deploy(
     session: boto3.Session,
     stack_name: str,
@@ -2059,7 +2114,7 @@ def ensure_core_iam_roles(
     session: boto3.Session,
     account_id: str,
     region: str,
-    propagation_delay: int = 12,
+    propagation_delay: int = 25,
     blobs_bucket: Optional[str] = None,
 ) -> List[str]:
     """
@@ -2546,10 +2601,10 @@ def ensure_core_iam_roles(
             print(f"  ⚠️ Warning: Failed configuring policies on {slack_cb_role_name}: {exc}")
 
     # 8. Propagation Delay for AWS STS eventual consistency
-    if roles_mutated:
+    if roles_mutated or len(remediated) > 0:
         effective_delay = 0 if os.environ.get("PYTEST_CURRENT_TEST") else propagation_delay
         if effective_delay > 0:
-            print(f"  ⏳ Waiting {effective_delay}s for IAM trust policies to propagate across regional STS...")
+            print(f"  ⏳ Waiting {effective_delay}s for IAM roles and trust policies to propagate across regional STS & Lambda service...")
             time.sleep(effective_delay)
 
     return remediated
@@ -2987,7 +3042,7 @@ def run_apply_mode(
         deploy_status = "SKIPPED"
         deploy_msg = "Deployment skipped via --skip-sam flag."
     else:
-        sam_cli = shutil.which("sam")
+        sam_cli = ensure_sam_cli()
         if not sam_cli:
             print("\n⚠️ 'sam' CLI was not found in PATH.")
             print("   Pre-deploy actions were executed. To deploy the serverless stack, install AWS SAM CLI and run:")
@@ -3002,12 +3057,12 @@ def run_apply_mode(
 
                 # Build
                 runtime_val = params.get("PythonRuntime") or detect_lambda_python_runtime(getattr(args, "python_runtime", ""))
-                build_cmd = ["sam", "build", "--parameter-overrides", f"PythonRuntime={runtime_val}"]
+                build_cmd = [sam_cli, "build", "--parameter-overrides", f"PythonRuntime={runtime_val}"]
                 print(f"  -> Running: {' '.join(build_cmd)}")
                 b_res = subprocess.run(build_cmd, cwd=project_root, capture_output=True, text=True)
                 if b_res.returncode != 0 and shutil.which("docker"):
                     print("  ⚠️ Local pip build encountered an issue. Attempting containerized build via 'sam build --use-container'...")
-                    container_cmd = ["sam", "build", "--use-container", "--parameter-overrides", f"PythonRuntime={runtime_val}"]
+                    container_cmd = [sam_cli, "build", "--use-container", "--parameter-overrides", f"PythonRuntime={runtime_val}"]
                     print(f"  -> Running: {' '.join(container_cmd)}")
                     b_res = subprocess.run(container_cmd, cwd=project_root, capture_output=True, text=True)
 
@@ -3019,7 +3074,7 @@ def run_apply_mode(
                     # Deploy
                     overrides_list = [f"{k}={v}" for k, v in params.items() if str(v).strip() != ""]
                     deploy_cmd = [
-                        "sam", "deploy",
+                        sam_cli, "deploy",
                         "--stack-name", args.stack_name,
                         "--region", region,
                         "--resolve-s3",

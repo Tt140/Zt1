@@ -14,3 +14,6 @@ moto[dynamodb,s3]>=5.0.0
 
 # Slack Socket Mode & interactive testing (used in demos and agent test harness)
 slack_sdk>=3.20.0
+
+# Infrastructure as Code (SAM CLI for build and deployment)
+aws-sam-cli

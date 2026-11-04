@@ -2178,7 +2178,52 @@ class TestSsmDocumentsReconciliation:
         assert "PythonRuntime=python3.11" in sam_cmd
 
 
+class TestSamCliBootstrap:
+    """
+    Tests for zero-touch auto-bootstrapping and discovery of aws-sam-cli.
+    """
 
+    def test_ensure_sam_cli_when_already_in_path(self):
+        from scripts.aws_onboard import ensure_sam_cli
 
+        with patch("shutil.which", return_value="/usr/local/bin/sam"):
+            assert ensure_sam_cli() == "/usr/local/bin/sam"
+
+    def test_ensure_sam_cli_finds_in_venv_bin(self, monkeypatch):
+        import sys
+        from scripts.aws_onboard import ensure_sam_cli
+
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        py_dir = os.path.dirname(sys.executable)
+        expected_sam = os.path.join(py_dir, "sam")
+
+        with patch("shutil.which", return_value=None):
+            with patch("os.path.isfile", side_effect=lambda p: p == expected_sam):
+                with patch("os.access", return_value=True):
+                    res = ensure_sam_cli()
+                    assert res == expected_sam
+                    assert py_dir in os.environ["PATH"]
+
+    def test_ensure_sam_cli_auto_bootstraps_via_pip(self, monkeypatch):
+        import sys
+        from scripts.aws_onboard import ensure_sam_cli
+
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+        calls = [None, "/installed/bin/sam"]
+        def fake_which(cmd):
+            return calls.pop(0) if calls else "/installed/bin/sam"
+
+        with patch("shutil.which", side_effect=fake_which):
+            with patch("os.path.isfile", return_value=False):
+                with patch("subprocess.run") as mock_run:
+                    mock_run.return_value = MagicMock(returncode=0, stderr="")
+                    res = ensure_sam_cli()
+                    assert res == "/installed/bin/sam"
+                    mock_run.assert_called_once_with(
+                        [sys.executable, "-m", "pip", "install", "aws-sam-cli"],
+                        capture_output=True,
+                        text=True,
+                    )
 
 
