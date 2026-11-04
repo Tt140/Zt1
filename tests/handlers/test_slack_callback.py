@@ -161,6 +161,7 @@ class TestSlackCallbackActions:
         step_id: str,
         user_id: str = "U123456",
         message_blocks: Optional[list] = None,
+        response_url: Optional[str] = None,
     ):
         from handlers import slack_callback as mod
         value = json.dumps({"incident_id": incident_id, "step_id": step_id})
@@ -169,6 +170,8 @@ class TestSlackCallbackActions:
             "user": {"id": user_id},
             "actions": [{"action_id": action_id, "value": value}],
         }
+        if response_url:
+            payload["response_url"] = response_url
         if message_blocks is not None:
             payload["message"] = {"blocks": message_blocks}
         body = urllib.parse.urlencode({"payload": json.dumps(payload)}).encode()
@@ -319,6 +322,74 @@ class TestSlackCallbackActions:
         assert body2.get("response_type") == "ephemeral"
         assert "Error recording approval" in body2.get("text", "")
         assert "cannot reuse" in body2.get("text", "")
+
+    def test_approve_dispatches_to_response_url_before_agent_invoke(self):
+        """
+        Ensures that when response_url is present in the payload:
+        1. An HTTP POST is dispatched to response_url containing replace_original=True and updated blocks.
+        2. The buttons are removed in-place.
+        3. Agent invoke_async is dispatched.
+        """
+        from handlers import slack_callback as mod
+
+        store = MemoryEventStore()
+        iid = _make_incident(store)
+        step_id = new_ulid()
+        orig_blocks = [
+            {"type": "actions", "block_id": "approval_actions", "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "Approve"}, "action_id": "approve"},
+            ]},
+        ]
+        test_url = "https://hooks.slack.com/actions/T123/B456/mock-callback-url"
+
+        posted_calls = []
+
+        def fake_post_response_url(url, payload_data):
+            posted_calls.append((url, payload_data))
+            return True
+
+        with patch.object(mod, "_post_response_url", side_effect=fake_post_response_url):
+            resp, mock_inv = self._call(
+                store, "approve", iid, step_id,
+                user_id="U123456", message_blocks=orig_blocks, response_url=test_url
+            )
+
+        assert resp["statusCode"] == 200
+        assert mock_inv.call_count == 1
+        assert len(posted_calls) == 1
+
+        # Verify payload posted to response_url
+        target_url, posted_payload = posted_calls[0]
+        assert target_url == test_url
+        assert posted_payload.get("replace_original") is True
+        blocks = posted_payload.get("blocks", [])
+        assert not any(b.get("type") == "actions" for b in blocks)
+        assert "Approved & Executing" in posted_payload.get("text", "")
+
+    def test_post_response_url_helper_resilience(self):
+        """Tests _post_response_url helper network success, failure, and empty url safety."""
+        from handlers.slack_callback import _post_response_url
+
+        # Empty url returns False safely without network call
+        assert _post_response_url("", {"foo": "bar"}) is False
+
+        # Mock urllib success
+        class MockResponse:
+            def getcode(self):
+                return 200
+            def read(self):
+                return b'{"ok": true}'
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        with patch("urllib.request.urlopen", return_value=MockResponse()):
+            assert _post_response_url("https://hooks.slack.com/actions/test", {"test": 1}) is True
+
+        # Mock urllib network exception handled gracefully (no uncaught error)
+        with patch("urllib.request.urlopen", side_effect=Exception("Connection timed out")):
+            assert _post_response_url("https://hooks.slack.com/actions/test", {"test": 1}) is False
 
     def test_unauthorized_user_approval_rejected_ephemeral(self):
         """

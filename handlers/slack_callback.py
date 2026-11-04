@@ -268,10 +268,38 @@ def _build_updated_slack_blocks(
     return status_text, updated_blocks
 
 
+def _post_response_url(response_url: str, payload_data: dict) -> bool:
+    """
+    Dispatches an HTTP POST request to Slack's ephemeral interaction response_url.
+    Slack requires POSTing to response_url with {"replace_original": True, "blocks": [...]}
+    in order to physically update the interactive message and remove action buttons in-place.
+    """
+    if not response_url:
+        return False
+    try:
+        import urllib.request
+        data = json.dumps(payload_data).encode("utf-8")
+        req = urllib.request.Request(
+            response_url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode("utf-8", errors="replace").strip()
+            logger.info(f"Slack response_url update delivered (status={resp.getcode()}): {body}")
+            return resp.getcode() == 200
+    except Exception as exc:
+        logger.error(f"Failed to post update to Slack response_url: {exc}")
+        return False
+
+
 def _handle_block_action(payload: dict) -> dict:
     actions = payload.get("actions", [])
     if not actions:
         return {"statusCode": 200, "body": ""}
+
+    response_url = payload.get("response_url", "").strip()
 
     action = actions[0]
     action_id = action.get("action_id", "")   # "approve" or "deny"
@@ -328,6 +356,24 @@ def _handle_block_action(payload: dict) -> dict:
             }),
         }
 
+    # Build updated Slack blocks (removing action buttons and adding confirmation context block)
+    original_blocks = payload.get("message", {}).get("blocks", [])
+    status_text, updated_blocks = _build_updated_slack_blocks(
+        original_blocks=original_blocks,
+        is_approve=is_approve,
+        step_id=step_id,
+        incident_id=incident_id,
+        user_id=approver,
+    )
+
+    # Dispatch in-place update directly to Slack's interaction response_url to immediately erase buttons
+    if response_url:
+        _post_response_url(response_url, {
+            "replace_original": True,
+            "text": status_text,
+            "blocks": updated_blocks,
+        })
+
     if is_approve:
         # Invoke agent asynchronously to resume investigation after approval
         try:
@@ -338,16 +384,6 @@ def _handle_block_action(payload: dict) -> dict:
             })
         except Exception as e:
             logger.error(f"Failed to invoke agent after approval: {e}")
-
-    # Build updated Slack blocks (removing action buttons and adding confirmation context block)
-    original_blocks = payload.get("message", {}).get("blocks", [])
-    status_text, updated_blocks = _build_updated_slack_blocks(
-        original_blocks=original_blocks,
-        is_approve=is_approve,
-        step_id=step_id,
-        incident_id=incident_id,
-        user_id=approver,
-    )
 
     return {
         "statusCode": 200,
