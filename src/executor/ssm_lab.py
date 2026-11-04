@@ -39,6 +39,9 @@ _T0_SSM_DOCUMENT = "incidents-observe-readonly"
 # T1: Restricted remediation — executor Lambda (after Policy Gate approval)
 _T1_SSM_DOCUMENT = "incidents-repair-restricted"
 
+# T2: Full remediation — executor Lambda (after human HMAC approval)
+_T2_SSM_DOCUMENT = "AWS-RunShellScript"
+
 _T0_ALLOWED_PREFIXES = frozenset([
     "df", "du", "free", "top", "ps", "cat", "head", "tail", "ls", "stat", "find",
     "systemctl status", "systemctl is-active", "systemctl is-failed", "systemctl list-units", "journalctl", "dmesg", "uptime",
@@ -156,17 +159,30 @@ class SSMLab:
         
         T0: observe-readonly document (no mutations)
         T1: repair-restricted document (restricted mutation, requires Gate approval)
+        T2: AWS-RunShellScript (human approved mutation via Policy Gate HMAC)
         Any other tier -> IsolationRequired (fail-closed)
         """
         if tier == "T0":
             ssm_doc = _T0_SSM_DOCUMENT
             allowed = _T0_ALLOWED_PREFIXES
+            use_general_doc = False
         elif tier == "T1":
             ssm_doc = _T1_SSM_DOCUMENT
             allowed = _T1_ALLOWED_PREFIXES
+            use_general_doc = False
+        elif tier == "T2":
+            # If command matches restricted repair allowlist (systemctl, truncate, mv, cp, rm, kill),
+            # prefer the restricted repair document; otherwise dispatch via AWS-RunShellScript for human-approved general repairs (e.g. sed).
+            if _command_prefix_allowed(command, _T1_ALLOWED_PREFIXES):
+                ssm_doc = _T1_SSM_DOCUMENT
+                use_general_doc = False
+            else:
+                ssm_doc = _T2_SSM_DOCUMENT
+                use_general_doc = True
+            allowed = None  # Human approved via PolicyGate & cryptographic HMAC token; no static prefix allowlist
         else:
             raise IsolationRequired(
-                f"SSMLab: tier={tier!r} not supported. Only T0/T1 allowed."
+                f"SSMLab: tier={tier!r} not supported. Only T0/T1/T2 allowed."
             )
 
         # Check prohibited shell operators and special characters (*, ?, |, ;, &&, ||, >, <, ``, $())
@@ -185,8 +201,8 @@ class SSMLab:
                 tier=tier,
             )
 
-        # For T1 commands: if command requires root privileges and is not prefixed with sudo, prepend sudo automatically
-        if tier == "T1":
+        # For commands running via restricted repair: if command requires root privileges and is not prefixed with sudo, prepend sudo automatically
+        if tier == "T1" or (tier == "T2" and not use_general_doc):
             stripped_cmd = command.strip()
             if not stripped_cmd.lower().startswith("sudo "):
                 if (
@@ -207,7 +223,7 @@ class SSMLab:
                     command = f"sudo {stripped_cmd}"
 
         # Verify against allowlist prior to dispatch
-        if not _command_prefix_allowed(command, allowed):
+        if allowed is not None and not _command_prefix_allowed(command, allowed):
             reason = f"Command not in {tier} allowlist: {command!r}"
             logger.warning(f"SSMLab: {reason}")
             return LabResult(
@@ -224,11 +240,14 @@ class SSMLab:
         ssm = self._get_ssm_client()
         t0  = time.time()
 
+        # AWS-RunShellScript expects {"commands": [command]}, whereas custom documents expect {"command": [command]}
+        params = {"commands": [command]} if use_general_doc else {"command": [command]}
+
         try:
             send_resp = ssm.send_command(
                 InstanceIds=[self._instance_id],
                 DocumentName=ssm_doc,
-                Parameters={"command": [command]},
+                Parameters=params,
                 TimeoutSeconds=max(30, timeout_seconds),
                 Comment=f"incidents-agent:{tier}",
             )
@@ -245,9 +264,9 @@ class SSMLab:
         # Poll for command execution result
         res = self._poll_result(ssm, command_id, tier, timeout_seconds, t0)
 
-        # ── Post-Start Active Check: Verify service remains active after starting in T1 ──
+        # ── Post-Start Active Check: Verify service remains active after starting in T1 or T2 ──
         clean_cmd = command.strip()
-        if tier == "T1" and res.success:
+        if (tier == "T1" or tier == "T2") and res.success:
             is_start_or_restart = (
                 "systemctl start " in clean_cmd or "systemctl restart " in clean_cmd
             )

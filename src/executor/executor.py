@@ -193,7 +193,12 @@ class ExecutorLoop:
         # ⑤ Execute command in isolated lab
         command = step.execution_spec.get("command", "")
         from ..domain.types import StepKind
-        exec_tier = "T1" if (gate_result.tier in (Tier.T1, Tier.T2) or step.kind == StepKind.mutate) else "T0"
+        if gate_result.tier in (Tier.T0, Tier.T1, Tier.T2):
+            exec_tier = gate_result.tier.value
+        elif step.kind == StepKind.mutate:
+            exec_tier = "T1"
+        else:
+            exec_tier = "T0"
         try:
             lab_result = self._lab.run(command, tier=exec_tier)
         except TypeError:
@@ -219,7 +224,7 @@ class ExecutorLoop:
             state = fold(self._store.read(state.incident_id))
 
             # Execution failed -> trigger rollback immediately
-            rollback_ok = self._run_rollback(step, state)
+            rollback_ok = self._run_rollback(step, state, tier=exec_tier)
             state = fold(self._store.read(state.incident_id))
 
             # Check failed step count against safety cap
@@ -271,7 +276,7 @@ class ExecutorLoop:
 
         if verify_result.verdict != VerificationVerdict.verified:
             # Verification failed after all retries -> rollback + escalate
-            rollback_ok = self._run_rollback(step, state)
+            rollback_ok = self._run_rollback(step, state, tier=exec_tier)
             state = fold(self._store.read(state.incident_id))
             self._write_escalated(state, f"Verification failed after {self._max_verify_attempts} attempts")
             state = fold(self._store.read(state.incident_id))
@@ -406,7 +411,7 @@ class ExecutorLoop:
         seq = self._store.last_seq(state.incident_id)
         self._store.append(state.incident_id, seq, ev)
 
-    def _run_rollback(self, step: StepRecord, state: IncidentState) -> bool:
+    def _run_rollback(self, step: StepRecord, state: IncidentState, tier: str = "T1") -> bool:
         """Executes rollback_plan actions sequentially."""
         seq = self._store.last_seq(state.incident_id)
         self._store.append(state.incident_id, seq, build_event(
@@ -420,6 +425,8 @@ class ExecutorLoop:
         ))
         seq += 1
 
+        from .docker_lab import _is_executable_command
+
         rollback_plan = step.rollback_plan
         success = True
         details = "none"
@@ -427,20 +434,34 @@ class ExecutorLoop:
         if isinstance(rollback_plan, list):
             for action in rollback_plan:
                 cmd = action.get("action", action.get("command", ""))
-                if cmd:
-                    try:
-                        res = self._lab.run(cmd, tier="T1")
-                    except TypeError:
-                        res = self._lab.run(cmd)
-                    success = success and res.success
-                    details = f"cmd={cmd!r} exit={res.exit_code}"
+                if cmd and cmd != "none":
+                    if _is_executable_command(cmd):
+                        try:
+                            res = self._lab.run(cmd, tier=tier)
+                        except TypeError:
+                            res = self._lab.run(cmd)
+                        success = success and res.success
+                        details = f"cmd={cmd!r} exit={res.exit_code}"
+                    else:
+                        logger.info(
+                            f"Rollback action is descriptive text rather than executable command: {cmd!r}. Skipping shell execution."
+                        )
+                        details = f"skipped_descriptive_action: {cmd!r}"
         elif rollback_plan != "none":
-            try:
-                res = self._lab.run(str(rollback_plan), tier="T1")
-            except TypeError:
-                res = self._lab.run(str(rollback_plan))
-            success = res.success
-            details = f"exit={res.exit_code}"
+            cmd_str = str(rollback_plan).strip()
+            if _is_executable_command(cmd_str):
+                try:
+                    res = self._lab.run(cmd_str, tier=tier)
+                except TypeError:
+                    res = self._lab.run(cmd_str)
+                success = res.success
+                details = f"exit={res.exit_code}"
+            else:
+                logger.info(
+                    f"Rollback plan is descriptive text rather than executable command: {cmd_str!r}. Skipping shell execution."
+                )
+                success = True
+                details = f"descriptive_guidance: {cmd_str[:80]!r}"
 
         seq = self._store.last_seq(state.incident_id)
         self._store.append(state.incident_id, seq, build_event(

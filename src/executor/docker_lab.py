@@ -26,7 +26,7 @@ import shlex
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
 
 # ────────────────────────────────────────────────────────────────────────────
 # Security Constraints
@@ -117,6 +117,47 @@ def _has_shell_operators(command: str) -> bool:
     Detects prohibited shell operators, expansion tokens, and chaining (*, ?, |, ;, &&, ||, >, <, ``, $()).
     """
     return bool(_SHELL_OPERATOR_RE.search(command))
+
+
+_KNOWN_COMMAND_BINARIES = frozenset([
+    "systemctl", "service", "journalctl", "rm", "mv", "cp", "sed", "awk",
+    "truncate", "kill", "pkill", "killall", "echo", "cat", "touch", "chmod",
+    "chown", "tar", "gzip", "gunzip", "ln", "dd", "mount", "umount",
+    "iptables", "ufw", "nft", "useradd", "userdel", "usermod", "groupadd",
+    "apt", "apt-get", "yum", "dnf", "apk", "pacman", "python", "python3",
+    "bash", "sh", "df", "du", "free", "grep", "curl", "find", "ls", "stat",
+    "head", "tail", "netstat", "ss", "lsof", "wc", "top", "ps", "uptime",
+    "pgrep", "mpstat", "vmstat", "pidstat", "date", "id", "whoami", "uname", "hostname"
+])
+
+
+def _is_executable_command(command: Any) -> bool:
+    """
+    Determines if a rollback_plan string is an executable shell command
+    rather than a natural language descriptive sentence (e.g. 'Restore original line...').
+    """
+    if not isinstance(command, str):
+        return False
+    cmd = command.strip()
+    if not cmd or cmd.lower() == "none":
+        return False
+
+    tokens = cmd.split()
+    if not tokens:
+        return False
+
+    first = tokens[0]
+    if first.lower() == "sudo":
+        if len(tokens) < 2:
+            return False
+        first = tokens[1]
+
+    # Relative or absolute binary path (e.g. /usr/bin/python, ./script.sh)
+    if first.startswith(("/", "./", "../")):
+        return True
+
+    # Check against known Linux command binaries
+    return first.lower() in _KNOWN_COMMAND_BINARIES
 
 
 # ────────────────────────────────────────────────────────────────────────────

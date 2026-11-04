@@ -163,6 +163,8 @@ class Reconciler:
         store.append(state.incident_id, seq, rollback_event)
         seq += 1
 
+        from .docker_lab import _is_executable_command
+
         # Execute rollback plan
         rollback_plan = step.rollback_plan
         success = True
@@ -172,16 +174,24 @@ class Reconciler:
             for action in rollback_plan:
                 cmd = action.get("action", action.get("command", ""))
                 if cmd and cmd != "none":
-                    result = self._lab.run(cmd)
-                    if not result.success:
-                        success = False
-                        details = f"rollback command failed: {cmd!r}"
-                        break
-                    details = f"rollback executed: {cmd!r}"
+                    if _is_executable_command(cmd):
+                        result = self._lab.run(cmd)
+                        if not result.success:
+                            success = False
+                            details = f"rollback command failed: {cmd!r}"
+                            break
+                        details = f"rollback executed: {cmd!r}"
+                    else:
+                        details = f"skipped_descriptive_action: {cmd!r}"
         elif rollback_plan != "none":
-            result = self._lab.run(str(rollback_plan))
-            success = result.success
-            details = f"rollback exit={result.exit_code}"
+            cmd_str = str(rollback_plan).strip()
+            if _is_executable_command(cmd_str):
+                result = self._lab.run(cmd_str)
+                success = result.success
+                details = f"rollback exit={result.exit_code}"
+            else:
+                success = True
+                details = f"descriptive_guidance: {cmd_str[:80]!r}"
 
         seq = store.last_seq(state.incident_id)
         rollback_done = build_event(

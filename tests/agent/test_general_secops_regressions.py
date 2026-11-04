@@ -82,6 +82,7 @@ def _make_step(
     resource: str,
     risk_claim: str = "low",
     kind: StepKind = StepKind.mutate,
+    rollback_plan: str = "none",
 ) -> StepRecord:
     step_id = new_ulid()
     effects = [DeclaredEffect(category=category, resource=resource, description="test action")]
@@ -96,7 +97,7 @@ def _make_step(
         declared_effects=effects,
         preconditions=[],
         success_criteria=[{"type": "exit_code", "value": 0}],
-        rollback_plan="none",
+        rollback_plan=rollback_plan,
         rollback_reason="test",
         idempotent=True,
         risk_claim=risk_claim,
@@ -219,6 +220,63 @@ class TestSSMLabAllowlistAndAutoSudo:
         called_cmd = mock_ssm.send_command.call_args[1]["Parameters"]["command"][0]
         assert called_cmd == "sudo mv /etc/ssl/certs/renewed.crt /etc/ssl/certs/active.crt"
         assert not called_cmd.startswith("sudo sudo ")
+
+    def test_t2_command_dispatched_via_aws_runshellscript(self):
+        """Tier T2 approved commands must dispatch to AWS-RunShellScript with 'commands' parameter."""
+        mock_ssm = MagicMock()
+        mock_ssm.send_command.return_value = {"Command": {"CommandId": "cmd-t2-456"}}
+        mock_ssm.get_command_invocation.return_value = {
+            "Status": "Success",
+            "StandardOutputContent": "edited file\n",
+            "StandardErrorContent": "",
+            "ResponseCode": 0,
+        }
+        lab = SSMLab(instance_id="i-test001", ssm_client=mock_ssm)
+
+        cmd = "sed -i '1s/^/# /' /etc/nginx/conf.d/fresh_t2_drill.conf"
+        res = lab.run(cmd, tier="T2")
+
+        assert res.success
+        assert res.exit_code == 0
+        assert res.tier == "T2"
+        assert res.stdout == "edited file\n"
+
+        # Verify send_command invocation arguments
+        mock_ssm.send_command.assert_called_once()
+        call_kwargs = mock_ssm.send_command.call_args[1]
+        assert call_kwargs["DocumentName"] == "AWS-RunShellScript"
+        assert call_kwargs["Parameters"] == {"commands": [cmd]}
+        assert call_kwargs["InstanceIds"] == ["i-test001"]
+
+    def test_t2_command_with_prohibited_shell_operators_blocked_locally(self):
+        """Even under Tier T2, shell injection operators like &&, ||, |, ; must be blocked locally."""
+        mock_ssm = MagicMock()
+        lab = SSMLab(instance_id="i-test001", ssm_client=mock_ssm)
+
+        res = lab.run("sed -i 's/a/b/' /etc/conf && rm -rf /", tier="T2")
+        assert not res.success
+        assert res.exit_code == -1
+        assert "Forbidden operator or wildcard" in (res.blocked_reason or "")
+        mock_ssm.send_command.assert_not_called()
+
+    def test_is_executable_command_recognizes_binaries_vs_natural_language(self):
+        """_is_executable_command correctly distinguishes shell commands from natural language prose."""
+        from src.executor.docker_lab import _is_executable_command
+
+        # Valid shell commands
+        assert _is_executable_command("sed -i '1s/^/# /' /etc/nginx/conf.d/fresh_t2_drill.conf")
+        assert _is_executable_command("sudo systemctl restart nginx")
+        assert _is_executable_command("cp /tmp/backup.conf /etc/nginx/nginx.conf")
+        assert _is_executable_command("rm -f /var/log/stale.log")
+        assert _is_executable_command("/usr/local/bin/custom_revert.sh")
+        assert _is_executable_command("./rollback.sh")
+
+        # Natural language descriptions or none
+        assert not _is_executable_command("Restore original line by removing leading '# ' from line 1 of the file.")
+        assert not _is_executable_command("Revert the configuration changes made to nginx")
+        assert not _is_executable_command("none")
+        assert not _is_executable_command("")
+        assert not _is_executable_command(None)
 
 
 # ===========================================================================
@@ -527,6 +585,88 @@ class TestPolicyGateAndSSMSecurityBoundaries:
         res = gate_evaluate(step, state, ctx)
         assert res.tier == Tier.T2
         assert res.decision == PolicyDecisionValue.allow
+
+    def test_executor_t2_execution_and_descriptive_rollback_tolerance(self):
+        """ExecutorLoop passes tier='T2' for approved T2 actions and handles descriptive rollback gracefully."""
+        from src.executor.executor import ExecutorLoop, ExecutorTermination
+        from src.executor.verifier import Verifier
+        from src.executor.reconciler import Reconciler
+        from src.executor.docker_lab import LabResult
+
+        store, state = _open_incident(instance_id="i-test001")
+        step = _make_step(
+            incident_id=state.incident_id,
+            target="i-test001",
+            command="sed -i '1s/^/# /' /etc/nginx/conf.d/fresh_t2_drill.conf",
+            category=EffectCategory.E2,
+            resource="/etc/nginx/conf.d/fresh_t2_drill.conf",
+            risk_claim="high",
+            rollback_plan="Restore original line by removing leading '# ' from line 1 of the file.",
+        )
+
+        # Generate HMAC approval for T2 step
+        expires_at = "2099-01-01T00:00:00+00:00"
+        approval = ApprovalGrantedPayload(
+            approval_id=new_ulid(),
+            step_id=step.step_id,
+            plan_hash=step.plan_hash,
+            approver_id="security-lead@example.com",
+            issued_at=utc_now().isoformat(),
+            expires_at=expires_at,
+            nonce="nonce-t2-exec-test",
+        )
+        import dataclasses
+        p_for_tag = dataclasses.asdict(approval)
+        p_for_tag.pop("auth_tag", None)
+        tag = compute_auth_tag(
+            incident_id=state.incident_id,
+            event_type="ApprovalGranted",
+            payload_dict=p_for_tag,
+            key=TEST_AUTH_KEY,
+        )
+        approval = dataclasses.replace(approval, auth_tag=tag)
+        ctx = GateContext(
+            kill_switch_active=False,
+            allowed_instance_id="i-test001",
+            enabled_t1_categories=frozenset([EffectCategory.E1, EffectCategory.E2, EffectCategory.E3]),
+            approval_event=approval,
+            approval_auth_tag=tag,
+            auth_key=TEST_AUTH_KEY,
+        )
+
+        # Mock Lab to capture tier argument
+        mock_lab = MagicMock()
+        mock_lab.backend_name = "mock_ssm"
+        # First call: execute command (fails to test rollback)
+        # Second call: rollback (should NOT be called because rollback_plan is descriptive prose)
+        mock_lab.run.return_value = LabResult(
+            success=False, stdout="", stderr="simulated execution failure",
+            exit_code=1, elapsed_seconds=0.1, tier="T2"
+        )
+
+        mock_verifier = MagicMock(spec=Verifier)
+        mock_reconciler = MagicMock(spec=Reconciler)
+
+        executor = ExecutorLoop(
+            store=store,
+            lab=mock_lab,
+            verifier=mock_verifier,
+            reconciler=mock_reconciler,
+            instance_id="i-test001",
+            allowed_instance_id="i-test001",
+            auto_resolve_incident=False,
+        )
+
+        result = executor.execute_step(step, state, gate_ctx=ctx)
+
+        from unittest.mock import call
+        # 1. Verify lab was called with tier='T2' (preceded only by pre-execution snapshot)
+        assert mock_lab.run.call_args_list[-1] == call(
+            "sed -i '1s/^/# /' /etc/nginx/conf.d/fresh_t2_drill.conf",
+            tier="T2"
+        )
+        # 2. Rollback was marked successful (not failed) because descriptive guidance was safely recorded
+        assert result.termination == ExecutorTermination.ROLLBACK
 
     def test_critical_service_mutation_strictly_refused(self):
         """Mutating critical services (sshd, systemd, amazon-ssm-agent) is strictly refused."""
