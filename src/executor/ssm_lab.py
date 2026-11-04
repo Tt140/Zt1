@@ -42,6 +42,13 @@ _T1_SSM_DOCUMENT = "incidents-repair-restricted"
 # T2: Full remediation — executor Lambda (after human HMAC approval)
 _T2_SSM_DOCUMENT = "AWS-RunShellScript"
 
+# Specific prefixes allowed by the incidents-repair-restricted SSM document regex pattern
+_REPAIR_DOCUMENT_PREFIXES = frozenset([
+    "systemctl restart", "systemctl start", "systemctl stop", "systemctl reload",
+    "kill", "pkill",
+    "rm -f", "rm -rf", "rm ", "rm", "truncate", "mv", "cp",
+])
+
 _T0_ALLOWED_PREFIXES = frozenset([
     "df", "du", "free", "top", "ps", "cat", "head", "tail", "ls", "stat", "find",
     "systemctl status", "systemctl is-active", "systemctl is-failed", "systemctl list-units", "journalctl", "dmesg", "uptime",
@@ -171,9 +178,11 @@ class SSMLab:
             allowed = _T1_ALLOWED_PREFIXES
             use_general_doc = False
         elif tier == "T2":
-            # If command matches restricted repair allowlist (systemctl, truncate, mv, cp, rm, kill),
-            # prefer the restricted repair document; otherwise dispatch via AWS-RunShellScript for human-approved general repairs (e.g. sed).
-            if _command_prefix_allowed(command, _T1_ALLOWED_PREFIXES):
+            # If command has shell operators, or is outside the strict repair document pattern,
+            # dispatch via AWS-RunShellScript. Only simple, non-operator repair commands
+            # (truncate, systemctl, mv, cp, rm, kill) can use the restricted repair document.
+            from .docker_lab import _has_shell_operators
+            if not _has_shell_operators(command) and _command_prefix_allowed(command, _REPAIR_DOCUMENT_PREFIXES):
                 ssm_doc = _T1_SSM_DOCUMENT
                 use_general_doc = False
             else:
@@ -186,8 +195,9 @@ class SSMLab:
             )
 
         # Check prohibited shell operators and special characters (*, ?, |, ;, &&, ||, >, <, ``, $())
+        # Strictly enforced for autonomous tiers (T0 and T1); bypassed for human-approved Tier.T2.
         from .docker_lab import _has_shell_operators
-        if _has_shell_operators(command):
+        if tier != "T2" and _has_shell_operators(command):
             reason = f"Forbidden operator or wildcard in command: {command[:60]!r}"
             logger.warning(f"SSMLab: {reason}")
             return LabResult(

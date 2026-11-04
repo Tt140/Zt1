@@ -207,7 +207,7 @@ class DockerBackend:
         """Returns rejection reason or None if permitted."""
         if _is_secret_path(command):
             return f"I-15: secret path blocked in command: {command[:60]!r}"
-        if _has_shell_operators(command):
+        if self._tier in ("T0", "T1") and _has_shell_operators(command):
             return f"shell operator or wildcard forbidden: {command[:60]!r}"
         if self._tier == "T0" and not _is_allowed_t0(command):
             return f"T0 allowlist: command not permitted: {command[:60]!r}"
@@ -323,7 +323,7 @@ class SubprocessBackend:
         if _is_secret_path(command):
             return f"I-15: secret path blocked: {command[:60]!r}"
         # Block shell operators — prevents secondary command injection after allowed command
-        if _has_shell_operators(command):
+        if self._tier in ("T0", "T1") and _has_shell_operators(command):
             return f"shell operator injection blocked (subprocess): {command[:60]!r}"
         # T0 allowlist — verifies command is permitted for read-only inspection
         if not _is_allowed_t0(command):

@@ -248,15 +248,56 @@ class TestSSMLabAllowlistAndAutoSudo:
         assert call_kwargs["Parameters"] == {"commands": [cmd]}
         assert call_kwargs["InstanceIds"] == ["i-test001"]
 
-    def test_t2_command_with_prohibited_shell_operators_blocked_locally(self):
-        """Even under Tier T2, shell injection operators like &&, ||, |, ; must be blocked locally."""
+    def test_t2_allows_shell_operators_and_redirection_when_human_approved(self):
+        """Tier T2 human-approved commands must allow shell operators (>, |, &&) via AWS-RunShellScript."""
+        mock_ssm = MagicMock()
+        mock_ssm.send_command.return_value = {"Command": {"CommandId": "cmd-t2-redirect-789"}}
+        mock_ssm.get_command_invocation.return_value = {
+            "Status": "Success",
+            "StandardOutputContent": "config written\n",
+            "StandardErrorContent": "",
+            "ResponseCode": 0,
+        }
+        lab = SSMLab(instance_id="i-test001", ssm_client=mock_ssm)
+
+        # 1. Shell redirection (>)
+        cmd_redirect = "echo 'worker_connections 2048;' > /etc/nginx/conf.d/tuning.conf"
+        res = lab.run(cmd_redirect, tier="T2")
+        assert res.success
+        assert res.exit_code == 0
+        assert res.tier == "T2"
+
+        call_kwargs = mock_ssm.send_command.call_args[1]
+        assert call_kwargs["DocumentName"] == "AWS-RunShellScript"
+        assert call_kwargs["Parameters"] == {"commands": [cmd_redirect]}
+
+        # 2. Pipeline and logical chaining (| and &&)
+        mock_ssm.reset_mock()
+        cmd_compound = "grep -q 'tuning' /etc/nginx/nginx.conf || echo 'include /etc/nginx/conf.d/*.conf;' >> /etc/nginx/nginx.conf"
+        res_comp = lab.run(cmd_compound, tier="T2")
+        assert res_comp.success
+        assert res_comp.exit_code == 0
+        call_kwargs2 = mock_ssm.send_command.call_args[1]
+        assert call_kwargs2["DocumentName"] == "AWS-RunShellScript"
+        assert call_kwargs2["Parameters"] == {"commands": [cmd_compound]}
+
+    def test_autonomous_t0_and_t1_strictly_block_shell_operators(self):
+        """Autonomous tiers (T0 and T1) must strictly reject shell operators (|, ;, &&, >) locally."""
         mock_ssm = MagicMock()
         lab = SSMLab(instance_id="i-test001", ssm_client=mock_ssm)
 
-        res = lab.run("sed -i 's/a/b/' /etc/conf && rm -rf /", tier="T2")
-        assert not res.success
-        assert res.exit_code == -1
-        assert "Forbidden operator or wildcard" in (res.blocked_reason or "")
+        # T0 with pipe
+        res_t0 = lab.run("cat /var/log/app.log | sh", tier="T0")
+        assert not res_t0.success
+        assert res_t0.exit_code == -1
+        assert "Forbidden operator or wildcard" in (res_t0.blocked_reason or "")
+        mock_ssm.send_command.assert_not_called()
+
+        # T1 with redirection
+        res_t1 = lab.run("echo 'hack' > /etc/passwd", tier="T1")
+        assert not res_t1.success
+        assert res_t1.exit_code == -1
+        assert "Forbidden operator or wildcard" in (res_t1.blocked_reason or "")
         mock_ssm.send_command.assert_not_called()
 
     def test_is_executable_command_recognizes_binaries_vs_natural_language(self):
